@@ -7,8 +7,11 @@ on:
       - 'benchmarks/ops/benchmark_rwkv7_flash_provider.py'
       - 'fla/models/rwkv7/__init__.py'
       - 'fla/ops/rwkv7/**'
+      - 'pyproject.toml'
+      - 'scripts/build_packages.py'
       - 'scripts/run_rwkv7_flash_adapter_ci.py'
       - 'tests/ops/test_rwkv7_backends.py'
+      - 'tests/test_rwkv7_flash_packaging.py'
   push:
     branches: [main]
     paths:
@@ -16,8 +19,11 @@ on:
       - 'benchmarks/ops/benchmark_rwkv7_flash_provider.py'
       - 'fla/models/rwkv7/__init__.py'
       - 'fla/ops/rwkv7/**'
+      - 'pyproject.toml'
+      - 'scripts/build_packages.py'
       - 'scripts/run_rwkv7_flash_adapter_ci.py'
       - 'tests/ops/test_rwkv7_backends.py'
+      - 'tests/test_rwkv7_flash_packaging.py'
   workflow_dispatch:
     inputs:
       approval:
@@ -45,7 +51,7 @@ permissions:
   pull-requests: write
 
 env:
-  FLASH_RWKV_SOURCE_REVISION: 69afbec2db9ffd3362962017a1fb36f2f333d1c6
+  FLASH_RWKV_SOURCE_REVISION: c637985558c398de1db6a3c0523b1eec206a88d4
 
 concurrency:
   group: rwkv7-flash-adapter-${{ github.event.pull_request.number || inputs.pr_number || github.ref }}
@@ -81,8 +87,10 @@ jobs:
             benchmarks/ops/benchmark_rwkv7_flash_provider.py \
             fla/models/rwkv7/__init__.py \
             fla/ops/rwkv7/backends \
+            scripts/build_packages.py \
             scripts/run_rwkv7_flash_adapter_ci.py \
-            tests/ops/test_rwkv7_backends.py
+            tests/ops/test_rwkv7_backends.py \
+            tests/test_rwkv7_flash_packaging.py
 
       - name: Run CPU adapter gate
         run: |

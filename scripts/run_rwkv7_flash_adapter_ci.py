@@ -21,7 +21,7 @@ from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 PRO6000_RUNNER_LABEL = "rwkv-sha-pro6000x8"
-FLASH_RWKV_SOURCE_REVISION = "69afbec2db9ffd3362962017a1fb36f2f333d1c6"
+FLASH_RWKV_SOURCE_REVISION = "c637985558c398de1db6a3c0523b1eec206a88d4"
 REVISION_PATTERN = re.compile(r"^[0-9a-f]{40}$")
 RESULT_FIELDS = ("label", "B", "T", "iters", "p10_ms", "p50_ms", "p90_ms", "tok_s_p50")
 
@@ -53,7 +53,9 @@ def _quick_gate(source_revision: str) -> None:
                 "-q",
                 "fla/ops/rwkv7/backends",
                 "benchmarks/ops/benchmark_rwkv7_flash_provider.py",
+                "scripts/build_packages.py",
                 "scripts/run_rwkv7_flash_adapter_ci.py",
+                "tests/test_rwkv7_flash_packaging.py",
             ],
             environment=environment,
         )
@@ -67,6 +69,16 @@ def _quick_gate(source_revision: str) -> None:
             "tests/ops/test_rwkv7_backends.py",
             "-k",
             "not real_provider",
+        ],
+        environment=environment,
+    )
+    _run(
+        [
+            sys.executable,
+            "-m",
+            "pytest",
+            "-q",
+            "tests/test_rwkv7_flash_packaging.py",
         ],
         environment=environment,
     )
@@ -95,9 +107,9 @@ def _validate_benchmark(
         "pr_number": pr_number,
         "flash_rwkv_source_revision": provider_revision,
         "backend": "flash_rwkv",
-        "reference_backend": "fla",
+        "reference_backend": "fla-explicit-oracle",
         "selected_provider": "flash_rwkv",
-        "baseline_provider": "fla",
+        "baseline_provider": "fla-explicit-oracle",
         "dtype": dtype,
         "B": batch_size,
         "T": tokens,
