@@ -21,6 +21,10 @@ from benchmarks.ops.benchmark_rwkv7_flash_provider import _format_result
 from fla.ops.rwkv7 import get_last_rwkv7_provider, recurrent_rwkv7
 from fla.ops.rwkv7.backends import flash_rwkv as flash_rwkv_backend
 from fla.ops.rwkv7.backends.flash_rwkv import (
+    FLASH_RWKV_EVIDENCE_ARTIFACT_DIGEST,
+    FLASH_RWKV_EVIDENCE_ARTIFACT_ID,
+    FLASH_RWKV_EVIDENCE_REVISION,
+    FLASH_RWKV_EVIDENCE_RUN_ID,
     FLASH_RWKV_SOURCE_REVISION,
     FlashRWKVBackend,
     FlashRWKVProvenanceError,
@@ -656,6 +660,13 @@ def test_pinned_revision_matches_ci_contract():
 
     assert f'FLASH_RWKV_SOURCE_REVISION = "{FLASH_RWKV_SOURCE_REVISION}"' in script
     assert f"FLASH_RWKV_SOURCE_REVISION: {FLASH_RWKV_SOURCE_REVISION}" in workflow
+    assert f'FLASH_RWKV_EVIDENCE_REVISION = "{FLASH_RWKV_EVIDENCE_REVISION}"' in script
+    assert f"FLASH_RWKV_EVIDENCE_RUN_ID = {FLASH_RWKV_EVIDENCE_RUN_ID}" in script
+    assert f"FLASH_RWKV_EVIDENCE_ARTIFACT_ID = {FLASH_RWKV_EVIDENCE_ARTIFACT_ID}" in script
+    assert (
+        f'FLASH_RWKV_EVIDENCE_ARTIFACT_DIGEST = "{FLASH_RWKV_EVIDENCE_ARTIFACT_DIGEST}"'
+        in script
+    )
 
 
 def test_benchmark_result_has_complete_stable_fields():
@@ -1271,7 +1282,7 @@ def _torch_rwkv7_packed(
             v[:, start:end],
             a[:, start:end],
             b[:, start:end],
-            initial_state=state_pool[slot : slot + 1],
+            initial_state=state_pool[slot: slot + 1],
             scale=scale,
         )
         output[:, start:end] = sequence_output
