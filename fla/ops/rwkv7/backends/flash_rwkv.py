@@ -82,18 +82,27 @@ def _git_output(repository: Path, *arguments: str) -> str:
 
 
 def _canonical_repository(url: str) -> str | None:
-    candidate = url.removeprefix("git+").rstrip("/")
+    candidate = url.removeprefix("git+")
     if candidate in {
         "git@github.com:rwkv-rs/FlashRWKV.git",
         "ssh://git@github.com/rwkv-rs/FlashRWKV.git",
     }:
         return FLASH_RWKV_REPOSITORY
     parsed = urlparse(candidate)
-    repository_path = parsed.path.removesuffix(".git").casefold()
+    try:
+        repository_path = parsed.path.encode("ascii").decode("ascii").lower()
+    except UnicodeEncodeError:
+        return None
     if (
         parsed.scheme == "https"
-        and parsed.hostname == "github.com"
-        and repository_path == "/rwkv-rs/flashrwkv"
+        and parsed.netloc == "github.com"
+        and repository_path
+        in {
+            "/rwkv-rs/flashrwkv",
+            "/rwkv-rs/flashrwkv/",
+            "/rwkv-rs/flashrwkv.git",
+            "/rwkv-rs/flashrwkv.git/",
+        }
         and not parsed.params
         and not parsed.query
         and not parsed.fragment

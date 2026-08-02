@@ -249,8 +249,11 @@ def _validate_packed_benchmark(
 
 def _validate_racecheck(path: Path, provider_revision: str) -> dict[str, object]:
     log = path.read_text(encoding="utf-8")
-    if "ERROR SUMMARY: 0 errors" not in log:
-        raise RuntimeError("Compute Sanitizer racecheck did not report zero errors")
+    zero_hazard_summary = "RACECHECK SUMMARY: 0 hazards displayed (0 errors, 0 warnings)"
+    if zero_hazard_summary not in log:
+        raise RuntimeError(
+            "Compute Sanitizer racecheck did not report zero hazards, errors, and warnings"
+        )
     for operation in (
         "recurrent_rwkv7_packed_stateful_fp32io16",
         "recurrent_rwkv7_packed_stateful_fp16",
