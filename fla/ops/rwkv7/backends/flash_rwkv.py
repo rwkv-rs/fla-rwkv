@@ -10,10 +10,16 @@
 from __future__ import annotations
 
 import importlib
+import importlib.metadata
 import inspect
+import json
 import math
 import re
+import subprocess
+from functools import cache
+from pathlib import Path
 from typing import TYPE_CHECKING
+from urllib.parse import unquote, urlparse
 
 import torch
 
@@ -22,6 +28,41 @@ from fla.ops.rwkv7.backends.provider import set_last_rwkv7_provider
 
 if TYPE_CHECKING:
     from fla.ops.cp import FLACPContext
+
+FLASH_RWKV_SOURCE_REVISION = "866aafd2eed146b0eda1ce03444009ae030f89e3"
+
+
+@cache
+def _installed_flash_rwkv_revision() -> str | None:
+    try:
+        distribution = importlib.metadata.distribution("flash-rwkv")
+    except importlib.metadata.PackageNotFoundError:
+        return None
+    direct_url = distribution.read_text("direct_url.json")
+    if not direct_url:
+        return None
+    try:
+        metadata = json.loads(direct_url)
+    except json.JSONDecodeError:
+        return None
+    revision = metadata.get("vcs_info", {}).get("commit_id")
+    if isinstance(revision, str) and re.fullmatch(r"[0-9a-f]{40}", revision):
+        return revision
+    source = metadata.get("url")
+    if not isinstance(source, str):
+        return None
+    parsed = urlparse(source)
+    if parsed.scheme != "file":
+        return None
+    try:
+        revision = subprocess.check_output(
+            ["git", "-C", str(Path(unquote(parsed.path))), "rev-parse", "HEAD"],
+            stderr=subprocess.DEVNULL,
+            text=True,
+        ).strip()
+    except (OSError, subprocess.CalledProcessError):
+        return None
+    return revision if re.fullmatch(r"[0-9a-f]{40}", revision) else None
 
 
 class FlashRWKVBackend(BaseBackend):
@@ -62,7 +103,10 @@ class FlashRWKVBackend(BaseBackend):
             "algorithm",
             "chunk_size",
         }
-        return required_parameters <= parameters.keys()
+        return (
+            required_parameters <= parameters.keys()
+            and _installed_flash_rwkv_revision() == FLASH_RWKV_SOURCE_REVISION
+        )
 
     def chunk_rwkv7_verifier(
         self,
@@ -209,4 +253,4 @@ class FlashRWKVBackend(BaseBackend):
         return output
 
 
-__all__ = ["FlashRWKVBackend"]
+__all__ = ["FLASH_RWKV_SOURCE_REVISION", "FlashRWKVBackend"]
