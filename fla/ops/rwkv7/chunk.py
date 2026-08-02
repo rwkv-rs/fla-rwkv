@@ -26,6 +26,8 @@ def chunk_rwkv7(
     output_final_state: bool = False,
     cu_seqlens: torch.LongTensor | None = None,
     cu_seqlens_cpu: torch.LongTensor | None = None,
+    state_indices: torch.LongTensor | None = None,
+    mode: str = "fp32io16",
     safe_gate: bool = False,
     chunk_size: int | None = None,
     disable_recompute: bool = False,
@@ -59,6 +61,10 @@ def chunk_rwkv7(
             consistent with the FlashAttention API.
         cu_seqlens_cpu (torch.LongTensor):
             CPU copy of `cu_seqlens` to avoid unnecessary device synchronization. Default: `None`.
+        state_indices (torch.LongTensor):
+            Request-owned state-pool rows for packed recurrent inference.
+        mode (str):
+            FlashRWKV numerical mode, either `fp32io16` or `fp16`.
         safe_gate (Optional[bool]):
             Whether the kernel can assume the input gate values `g` are in a safe range.
             When `True`, the kernel can use M=16 TensorCore acceleration.
@@ -75,6 +81,65 @@ def chunk_rwkv7(
     if "head_first" in kwargs:
         raise DeprecationWarning(
             "head_first has been removed. Inputs must be in `[B, T, H, ...]` format.",
+        )
+    if state_indices is not None:
+        from fla.ops.rwkv7.backends.flash_rwkv import FlashRWKVBackend
+
+        backend = FlashRWKVBackend()
+        set_last_rwkv7_provider(None)
+        if not backend.is_available():
+            raise RuntimeError(
+                "state-indexed RWKV7 execution requires the fixed FlashRWKV provider"
+            )
+        accepted, reason = backend.chunk_rwkv7_verifier(
+            r,
+            w,
+            k,
+            v,
+            a,
+            b,
+            scale=scale,
+            initial_state=initial_state,
+            output_final_state=output_final_state,
+            cu_seqlens=cu_seqlens,
+            cu_seqlens_cpu=cu_seqlens_cpu,
+            state_indices=state_indices,
+            mode=mode,
+            safe_gate=safe_gate,
+            chunk_size=chunk_size,
+            disable_recompute=disable_recompute,
+            cp_context=cp_context,
+            **kwargs,
+        )
+        if not accepted:
+            raise RuntimeError(
+                "state-indexed FlashRWKV execution rejected the call: "
+                f"{reason}"
+            )
+        return backend.chunk_rwkv7(
+            r,
+            w,
+            k,
+            v,
+            a,
+            b,
+            scale=scale,
+            initial_state=initial_state,
+            output_final_state=output_final_state,
+            cu_seqlens=cu_seqlens,
+            cu_seqlens_cpu=cu_seqlens_cpu,
+            state_indices=state_indices,
+            mode=mode,
+            safe_gate=safe_gate,
+            chunk_size=chunk_size,
+            disable_recompute=disable_recompute,
+            cp_context=cp_context,
+            **kwargs,
+        )
+    if mode != "fp32io16":
+        set_last_rwkv7_provider(None)
+        raise RuntimeError(
+            "mode other than 'fp32io16' requires FlashRWKV; fallback is disabled"
         )
     set_last_rwkv7_provider(None)
     result = chunk_dplr_delta_rule(

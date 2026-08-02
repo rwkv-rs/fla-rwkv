@@ -86,6 +86,7 @@ class FlashRWKVBackend(BaseBackend):
             if version_match is None or tuple(map(int, version_match.groups())) < (0, 1, 0):
                 return False
             parameters = inspect.signature(module.rwkv7).parameters
+            stateful_parameters = inspect.signature(module.rwkv7_recurrent_stateful).parameters
         except (AttributeError, ImportError, TypeError, ValueError):
             return False
         required_parameters = {
@@ -103,8 +104,22 @@ class FlashRWKVBackend(BaseBackend):
             "algorithm",
             "chunk_size",
         }
+        required_stateful_parameters = {
+            "r",
+            "log_decay",
+            "k",
+            "v",
+            "a",
+            "b",
+            "state_pool",
+            "cu_seqlens",
+            "state_indices",
+            "scale",
+            "mode",
+        }
         return (
             required_parameters <= parameters.keys()
+            and required_stateful_parameters <= stateful_parameters.keys()
             and _installed_flash_rwkv_revision() == FLASH_RWKV_SOURCE_REVISION
         )
 
@@ -121,6 +136,8 @@ class FlashRWKVBackend(BaseBackend):
         output_final_state: bool = False,
         cu_seqlens: torch.LongTensor | None = None,
         cu_seqlens_cpu: torch.LongTensor | None = None,
+        state_indices: torch.LongTensor | None = None,
+        mode: str = "fp32io16",
         safe_gate: bool = False,
         chunk_size: int | None = None,
         disable_recompute: bool = False,
@@ -150,6 +167,10 @@ class FlashRWKVBackend(BaseBackend):
                 return False, "FlashRWKV requires a finite scale"
         except (TypeError, ValueError):
             return False, "FlashRWKV requires a finite scale"
+        if mode not in {"fp32io16", "fp16"}:
+            return False, "FlashRWKV mode must be 'fp32io16' or 'fp16'"
+        if mode == "fp16" and any(tensor.dtype != torch.float16 for tensor in tensors):
+            return False, "FlashRWKV mode='fp16' requires float16 inputs"
         requires_grad = any(tensor.requires_grad for tensor in tensors) or (
             initial_state is not None and initial_state.requires_grad
         )
@@ -171,6 +192,20 @@ class FlashRWKVBackend(BaseBackend):
             if any(end <= start for start, end in zip(offsets[:-1], offsets[1:], strict=True)):
                 return False, "FlashRWKV cu_seqlens must be strictly increasing"
             expected_state_rows = len(offsets) - 1
+            if state_indices is not None:
+                if initial_state is None:
+                    return False, "FlashRWKV state_indices requires an initial state pool"
+                if state_indices.ndim != 1 or state_indices.dtype not in {torch.int32, torch.int64}:
+                    return False, "FlashRWKV state_indices must be a rank-1 int32 or int64 tensor"
+                if not state_indices.is_contiguous():
+                    return False, "FlashRWKV state_indices must be contiguous"
+                if state_indices.device.type != "cpu" and state_indices.device != r.device:
+                    return False, "FlashRWKV state_indices must be on CPU or the input device"
+                indices = tuple(int(value) for value in state_indices.detach().cpu().tolist())
+                if len(indices) != expected_state_rows:
+                    return False, "FlashRWKV state_indices length must match the packed sequence count"
+                if len(set(indices)) != len(indices):
+                    return False, "FlashRWKV state_indices must be unique within one call"
             if cu_seqlens_cpu is not None:
                 if (
                     cu_seqlens_cpu.device.type != "cpu"
@@ -183,12 +218,14 @@ class FlashRWKVBackend(BaseBackend):
                     return False, "FlashRWKV cu_seqlens_cpu must match cu_seqlens"
         elif cu_seqlens_cpu is not None:
             return False, "FlashRWKV cu_seqlens_cpu requires cu_seqlens"
+        elif state_indices is not None:
+            return False, "FlashRWKV state_indices requires cu_seqlens"
         if initial_state is not None:
-            if initial_state.ndim != 4 or initial_state.shape != (
-                expected_state_rows,
-                r.shape[2],
-                r.shape[3],
-                v.shape[3],
+            expected_trailing_shape = (r.shape[2], r.shape[3], v.shape[3])
+            if (
+                initial_state.ndim != 4
+                or initial_state.shape[1:] != expected_trailing_shape
+                or (state_indices is None and initial_state.shape[0] != expected_state_rows)
             ):
                 return False, "FlashRWKV initial_state must have shape [N, H, K, V] matching the input layout"
             if not initial_state.is_floating_point():
@@ -199,6 +236,12 @@ class FlashRWKVBackend(BaseBackend):
                 return False, "FlashRWKV requires initial_state on the input device"
             if requires_grad and initial_state.dtype != torch.float32:
                 return False, "FlashRWKV training requires an FP32 initial_state"
+            if state_indices is not None:
+                if any(index < 0 or index >= initial_state.shape[0] for index in indices):
+                    return False, "FlashRWKV state_indices entries must be within the state pool"
+                expected_state_dtype = torch.float32 if mode == "fp32io16" else torch.float16
+                if initial_state.dtype != expected_state_dtype:
+                    return False, f"FlashRWKV stateful {mode} requires a {expected_state_dtype} state pool"
         if cp_context is not None:
             return False, "FlashRWKV does not support context parallel execution"
         if safe_gate:
@@ -224,6 +267,8 @@ class FlashRWKVBackend(BaseBackend):
         output_final_state: bool = False,
         cu_seqlens: torch.LongTensor | None = None,
         cu_seqlens_cpu: torch.LongTensor | None = None,
+        state_indices: torch.LongTensor | None = None,
+        mode: str = "fp32io16",
         safe_gate: bool = False,
         chunk_size: int | None = None,
         disable_recompute: bool = False,
@@ -234,21 +279,37 @@ class FlashRWKVBackend(BaseBackend):
         import flash_rwkv
 
         set_last_rwkv7_provider(None)
-        output = flash_rwkv.rwkv7(
-            r,
-            w,
-            k,
-            v,
-            a,
-            b,
-            scale=scale,
-            initial_state=initial_state,
-            output_final_state=output_final_state,
-            cu_seqlens=cu_seqlens,
-            mode="fp32io16",
-            algorithm="chunk",
-            chunk_size=chunk_size,
-        )
+        if state_indices is not None:
+            output = flash_rwkv.rwkv7_recurrent_stateful(
+                r,
+                w,
+                k,
+                v,
+                a,
+                b,
+                state_pool=initial_state,
+                cu_seqlens=cu_seqlens,
+                state_indices=state_indices,
+                scale=scale,
+                mode=mode,
+            )
+            output = (output, initial_state if output_final_state else None)
+        else:
+            output = flash_rwkv.rwkv7(
+                r,
+                w,
+                k,
+                v,
+                a,
+                b,
+                scale=scale,
+                initial_state=initial_state,
+                output_final_state=output_final_state,
+                cu_seqlens=cu_seqlens,
+                mode=mode,
+                algorithm="chunk",
+                chunk_size=chunk_size,
+            )
         set_last_rwkv7_provider("flash_rwkv")
         return output
 
