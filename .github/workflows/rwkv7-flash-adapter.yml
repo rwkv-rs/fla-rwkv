@@ -1,0 +1,196 @@
+name: RWKV7 Flash adapter contract
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/rwkv7-flash-adapter.yml'
+      - 'benchmarks/ops/benchmark_rwkv7_flash_provider.py'
+      - 'fla/ops/rwkv7/**'
+      - 'scripts/run_rwkv7_flash_adapter_ci.py'
+      - 'tests/ops/test_rwkv7_backends.py'
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/rwkv7-flash-adapter.yml'
+      - 'benchmarks/ops/benchmark_rwkv7_flash_provider.py'
+      - 'fla/ops/rwkv7/**'
+      - 'scripts/run_rwkv7_flash_adapter_ci.py'
+      - 'tests/ops/test_rwkv7_backends.py'
+  workflow_dispatch:
+    inputs:
+      approval:
+        description: 'Confirm that a maintainer reviewed this exact source revision for native CUDA execution.'
+        required: true
+        type: choice
+        options:
+          - do-not-run
+          - run-trusted-revision
+      pr_number:
+        description: 'Open pull request number whose exact head revision will run.'
+        required: true
+        type: string
+      source_revision:
+        description: 'Full 40-character pull request head revision reviewed by the maintainer.'
+        required: true
+        type: string
+      provider_revision:
+        description: 'Full 40-character published FlashRWKV revision to build and benchmark.'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: rwkv7-flash-adapter-${{ github.event.pull_request.number || inputs.pr_number || github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  quick-cpu-static:
+    name: Quick CPU and static gate
+    if: github.event_name != 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          version: '0.11.16'
+          python-version: '3.12'
+          enable-cache: true
+
+      - name: Create CPU environment
+        run: |
+          uv venv .venv --python 3.12
+          uv pip install --python .venv/bin/python '.[cpu,test]' 'ruff==0.16.0'
+
+      - name: Run static checks
+        run: |
+          .venv/bin/ruff check \
+            benchmarks/ops/benchmark_rwkv7_flash_provider.py \
+            fla/ops/rwkv7/backends \
+            scripts/run_rwkv7_flash_adapter_ci.py \
+            tests/ops/test_rwkv7_backends.py
+
+      - name: Run CPU adapter gate
+        run: |
+          .venv/bin/python scripts/run_rwkv7_flash_adapter_ci.py quick \
+            --source-revision "$(git rev-parse HEAD)"
+
+  authorize-gpu:
+    name: Resolve maintainer-approved revision
+    if: github.event_name == 'workflow_dispatch' && inputs.approval == 'run-trusted-revision'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      source_repository: ${{ steps.resolve.outputs.source_repository }}
+      source_revision: ${{ steps.resolve.outputs.source_revision }}
+      provider_revision: ${{ steps.resolve.outputs.provider_revision }}
+      pr_number: ${{ steps.resolve.outputs.pr_number }}
+      artifact_name: ${{ steps.resolve.outputs.artifact_name }}
+    steps:
+      - name: Bind dispatch inputs to the open PR head
+        id: resolve
+        uses: actions/github-script@v9.0.0
+        env:
+          PR_NUMBER: ${{ inputs.pr_number }}
+          SOURCE_REVISION: ${{ inputs.source_revision }}
+          PROVIDER_REVISION: ${{ inputs.provider_revision }}
+        with:
+          script: |
+            const revisionPattern = /^[0-9a-f]{40}$/;
+            const prNumber = Number(process.env.PR_NUMBER);
+            const sourceRevision = process.env.SOURCE_REVISION;
+            const providerRevision = process.env.PROVIDER_REVISION;
+            if (!Number.isInteger(prNumber) || prNumber <= 0) {
+              core.setFailed('pr_number must be a positive integer');
+              return;
+            }
+            if (!revisionPattern.test(sourceRevision) || !revisionPattern.test(providerRevision)) {
+              core.setFailed('source_revision and provider_revision must be full lowercase Git revisions');
+              return;
+            }
+            const { data: pr } = await github.rest.pulls.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: prNumber,
+            });
+            if (pr.state !== 'open' || pr.head.sha !== sourceRevision || !pr.head.repo?.full_name) {
+              core.setFailed('dispatch source_revision must equal the current head of an open pull request');
+              return;
+            }
+            core.setOutput('source_repository', pr.head.repo.full_name);
+            core.setOutput('source_revision', sourceRevision);
+            core.setOutput('provider_revision', providerRevision);
+            core.setOutput('pr_number', String(prNumber));
+            core.setOutput('artifact_name', `rwkv7-flash-adapter-pr-${prNumber}-${sourceRevision}`);
+
+  gpu-test-and-benchmark:
+    name: PRO6000 FlashRWKV test and benchmark
+    needs: authorize-gpu
+    if: needs.authorize-gpu.result == 'success'
+    runs-on: [self-hosted, linux, x64, rwkv-sha-pro6000x8]
+    timeout-minutes: 90
+    env:
+      CUDA_VISIBLE_DEVICES: '0'
+      RWKV7_BENCH_RUNNER_LABEL: rwkv-sha-pro6000x8
+    steps:
+      - name: Check out the approved source revision
+        uses: actions/checkout@v7.0.0
+        with:
+          repository: ${{ needs.authorize-gpu.outputs.source_repository }}
+          ref: ${{ needs.authorize-gpu.outputs.source_revision }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify immutable source checkout
+        env:
+          EXPECTED_SOURCE_REVISION: ${{ needs.authorize-gpu.outputs.source_revision }}
+        run: test "$(git rev-parse HEAD)" = "$EXPECTED_SOURCE_REVISION"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          version: '0.11.16'
+          python-version: '3.12'
+          enable-cache: false
+
+      - name: Build the pinned GPU environment
+        env:
+          PROVIDER_REVISION: ${{ needs.authorize-gpu.outputs.provider_revision }}
+        run: |
+          uv venv .venv --python 3.12
+          uv pip install --python .venv/bin/python \
+            'torch==2.11.0' 'einops' 'transformers>=4.45.0' \
+            'pytest==9.1.1' 'ninja' 'setuptools>=77.0.3,<81.0.0' 'wheel'
+          uv pip install --python .venv/bin/python --no-deps -e .
+          uv pip install --python .venv/bin/python --no-build-isolation --no-deps \
+            "flash-rwkv @ git+https://github.com/rwkv-rs/FlashRWKV.git@${PROVIDER_REVISION}"
+
+      - name: Run approved provider tests and benchmarks
+        env:
+          SOURCE_REVISION: ${{ needs.authorize-gpu.outputs.source_revision }}
+          PROVIDER_REVISION: ${{ needs.authorize-gpu.outputs.provider_revision }}
+          PR_NUMBER: ${{ needs.authorize-gpu.outputs.pr_number }}
+        run: |
+          .venv/bin/python scripts/run_rwkv7_flash_adapter_ci.py gpu \
+            --source-revision "$SOURCE_REVISION" \
+            --provider-revision "$PROVIDER_REVISION" \
+            --runner-label "$RWKV7_BENCH_RUNNER_LABEL" \
+            --pr-number "$PR_NUMBER" \
+            --output-dir artifacts/rwkv7-flash-adapter
+
+      - name: Upload revision-bound benchmark evidence
+        if: always()
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: ${{ needs.authorize-gpu.outputs.artifact_name }}
+          path: artifacts/rwkv7-flash-adapter/*.json
+          if-no-files-found: error
+          retention-days: 30
