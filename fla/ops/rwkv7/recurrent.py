@@ -48,41 +48,10 @@ def recurrent_rwkv7(
         raise DeprecationWarning(
             "head_first has been removed. Inputs must be in `[B, T, H, ...]` format.",
         )
-    from fla.ops.rwkv7.backends.flash_rwkv import (
-        FLASH_RWKV_SOURCE_REVISION,
-        FlashRWKVBackend,
-    )
-
-    backend = FlashRWKVBackend()
     set_last_rwkv7_provider(None)
-    if not backend.is_available():
-        raise RuntimeError(
-            "public RWKV7 recurrent execution requires the exact FlashRWKV "
-            f"provider at {FLASH_RWKV_SOURCE_REVISION}; fallback is disabled"
-        )
-    accepted, reason = backend.recurrent_rwkv7_verifier(
-        r,
-        w,
-        k,
-        v,
-        a,
-        b,
-        scale=scale,
-        initial_state=initial_state,
-        output_final_state=output_final_state,
-        cu_seqlens=cu_seqlens,
-        cu_seqlens_cpu=cu_seqlens_cpu,
-        state_indices=state_indices,
-        mode=mode,
-        safe_gate=safe_gate,
-        chunk_size=chunk_size,
-        disable_recompute=disable_recompute,
-        cp_context=cp_context,
-        **kwargs,
-    )
     raise RuntimeError(
-        "exact FlashRWKV provider rejected public RWKV7 recurrent execution: "
-        f"{reason if not accepted else 'backend dispatch was bypassed'}"
+        "public RWKV7 recurrent execution requires the exact FlashRWKV "
+        "backend; fallback is disabled"
     )
 
 

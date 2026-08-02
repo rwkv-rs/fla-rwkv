@@ -32,14 +32,8 @@ from fla.ops.rwkv7.backends.provider import set_last_rwkv7_provider
 if TYPE_CHECKING:
     from fla.ops.cp import FLACPContext
 
-FLASH_RWKV_SOURCE_REVISION = "94cf28084a899f7157fb987a178ad02205966706"
+FLASH_RWKV_SOURCE_REVISION = "e81f90108feaafa4d04d552b048ed929a737643e"
 FLASH_RWKV_REPOSITORY = "https://github.com/rwkv-rs/FlashRWKV.git"
-FLASH_RWKV_EVIDENCE_REVISION = "71dd68897ffa79b727409b299ddea2c0eaba2563"
-FLASH_RWKV_EVIDENCE_RUN_ID = 30751092211
-FLASH_RWKV_EVIDENCE_ARTIFACT_ID = 8834636910
-FLASH_RWKV_EVIDENCE_ARTIFACT_DIGEST = (
-    "sha256:1640178254d96db98c60adf630372d60be7e797a21896a33613da69cc8823542"
-)
 
 
 class FlashRWKVProvenanceError(RuntimeError):
@@ -334,11 +328,7 @@ class FlashRWKVBackend(BaseBackend):
     package_name = "flash_rwkv"
     env_var = "FLA_FLASH_RWKV"
     default_enable = True
-    fail_closed_on_explicit_enable = True
     priority = 3
-
-    def on_explicit_failure(self) -> None:
-        set_last_rwkv7_provider(None)
 
     @classmethod
     def is_available(cls) -> bool:
@@ -384,8 +374,12 @@ class FlashRWKVBackend(BaseBackend):
             return False, "FlashRWKV requires matching [B, T, H, D] input shapes"
         if any(dimension <= 0 for dimension in r.shape) or v.shape[-1] <= 0:
             return False, "FlashRWKV requires positive B, T, H, K, and V dimensions"
-        if r.shape[-1] != 64 or v.shape[-1] != 64:
-            return False, f"FlashRWKV requires K=V=64, got K={r.shape[-1]}, V={v.shape[-1]}"
+        supported_head_sizes = {64, 128, 256}
+        if r.shape[-1] != v.shape[-1] or r.shape[-1] not in supported_head_sizes:
+            return False, (
+                "FlashRWKV requires equal K and V in {64, 128, 256}, "
+                f"got K={r.shape[-1]}, V={v.shape[-1]}"
+            )
         try:
             if not math.isfinite(float(scale)):
                 return False, "FlashRWKV requires a finite scale"
@@ -541,10 +535,6 @@ class FlashRWKVBackend(BaseBackend):
 
 
 __all__ = [
-    "FLASH_RWKV_EVIDENCE_ARTIFACT_DIGEST",
-    "FLASH_RWKV_EVIDENCE_ARTIFACT_ID",
-    "FLASH_RWKV_EVIDENCE_REVISION",
-    "FLASH_RWKV_EVIDENCE_RUN_ID",
     "FLASH_RWKV_REPOSITORY",
     "FLASH_RWKV_SOURCE_REVISION",
     "FlashRWKVBackend",
