@@ -419,6 +419,33 @@ def test_flash_rwkv_availability_revalidates_public_provenance(monkeypatch):
 
 
 @pytest.mark.parametrize(
+    "url",
+    [
+        "https://github.com/rwkv-rs/FlashRWKV.git",
+        "https://github.com/rwkv-rs/flashrwkv",
+        "git+https://github.com/rwkv-rs/FlashRWKV.git",
+        "git@github.com:rwkv-rs/FlashRWKV.git",
+        "ssh://git@github.com/rwkv-rs/FlashRWKV.git",
+    ],
+)
+def test_flash_rwkv_repository_canonicalization_accepts_exact_repo(url):
+    assert flash_rwkv_backend._canonical_repository(url) == flash_rwkv_backend.FLASH_RWKV_REPOSITORY
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://github.com/rwkv-rs/FlashRWKV.git",
+        "https://example.com/rwkv-rs/FlashRWKV.git",
+        "https://github.com/rwkv-rs/FlashRWKV-fork.git",
+        "https://github.com/rwkv-rs/FlashRWKV.git?ref=main",
+    ],
+)
+def test_flash_rwkv_repository_canonicalization_rejects_foreign_source(url):
+    assert flash_rwkv_backend._canonical_repository(url) is None
+
+
+@pytest.mark.parametrize(
     ("scenario", "expected"),
     [
         ("dirty-editable", "checkout is dirty"),
@@ -489,7 +516,7 @@ direct_url = (
     {"url": source_root.as_uri(), "dir_info": {"editable": True}}
     if editable
     else {
-        "url": backend.FLASH_RWKV_REPOSITORY,
+        "url": "https://github.com/rwkv-rs/flashrwkv",
         "vcs_info": {
             "vcs": "git",
             "commit_id": (

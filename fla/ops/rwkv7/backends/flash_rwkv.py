@@ -83,12 +83,21 @@ def _git_output(repository: Path, *arguments: str) -> str:
 
 def _canonical_repository(url: str) -> str | None:
     candidate = url.removeprefix("git+").rstrip("/")
-    if candidate == FLASH_RWKV_REPOSITORY:
-        return FLASH_RWKV_REPOSITORY
     if candidate in {
         "git@github.com:rwkv-rs/FlashRWKV.git",
         "ssh://git@github.com/rwkv-rs/FlashRWKV.git",
     }:
+        return FLASH_RWKV_REPOSITORY
+    parsed = urlparse(candidate)
+    repository_path = parsed.path.removesuffix(".git").casefold()
+    if (
+        parsed.scheme == "https"
+        and parsed.hostname == "github.com"
+        and repository_path == "/rwkv-rs/flashrwkv"
+        and not parsed.params
+        and not parsed.query
+        and not parsed.fragment
+    ):
         return FLASH_RWKV_REPOSITORY
     return None
 
@@ -239,7 +248,7 @@ def validate_flash_rwkv_installation() -> FlashRWKVProvenance:
         distribution_root = source_root
     else:
         repository = _canonical_repository(source)
-        if repository is None or source != FLASH_RWKV_REPOSITORY:
+        if repository is None:
             raise FlashRWKVProvenanceError(
                 f"flash-rwkv must come from {FLASH_RWKV_REPOSITORY}"
             )
