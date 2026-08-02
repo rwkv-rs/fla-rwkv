@@ -57,7 +57,7 @@ def test_flash_rwkv_backend_requires_opt_in(monkeypatch):
     ("overrides", "kwargs", "reason"),
     [
         ({"r": _tensor(cuda=False, device="cpu")}, {}, "FlashRWKV requires CUDA tensors"),
-        ({"r": _tensor(dtype=torch.bfloat16)}, {}, "FlashRWKV requires float16 inputs"),
+        ({"r": _tensor(dtype=torch.float32)}, {}, "FlashRWKV requires float16 or bfloat16 inputs"),
         ({"r": _tensor(shape=(1, 32, 128))}, {}, "FlashRWKV requires rank-4 [B, T, H, D] inputs"),
         ({"r": _tensor(contiguous=False)}, {}, "FlashRWKV requires contiguous inputs"),
         ({"v": _tensor(size=128)}, {}, "FlashRWKV requires K=V=64, got K=64, V=128"),
@@ -223,3 +223,47 @@ def test_failed_provider_call_clears_stale_success(monkeypatch):
     with pytest.raises(RuntimeError, match="provider failed"):
         chunk_rwkv7(**_call_args())
     assert get_last_rwkv7_provider() is None
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_flash_rwkv_real_provider_matches_fla_training_cell(monkeypatch, dtype):
+    torch.manual_seed(7)
+    inputs = [
+        (torch.randn(1, 16, 1, 64, device="cuda", dtype=dtype) * 0.02)
+        .contiguous()
+        .requires_grad_()
+        for _ in range(6)
+    ]
+    inputs[1] = torch.full_like(inputs[1], -0.1, requires_grad=True)
+    initial_state = torch.zeros(
+        1, 1, 64, 64, device="cuda", dtype=torch.float32, requires_grad=True
+    )
+
+    monkeypatch.delenv("FLA_FLASH_RWKV", raising=False)
+    baseline_inputs = [tensor.detach().clone().requires_grad_() for tensor in inputs]
+    baseline_state = initial_state.detach().clone().requires_grad_()
+    expected, expected_state = chunk_rwkv7(
+        *baseline_inputs,
+        initial_state=baseline_state,
+        output_final_state=True,
+        chunk_size=16,
+    )
+    (expected.float().square().mean() + expected_state.square().mean()).backward()
+
+    monkeypatch.setenv("FLA_FLASH_RWKV", "1")
+    actual, actual_state = chunk_rwkv7(
+        *inputs,
+        initial_state=initial_state,
+        output_final_state=True,
+        chunk_size=16,
+    )
+    (actual.float().square().mean() + actual_state.square().mean()).backward()
+
+    assert get_last_rwkv7_provider() == "flash_rwkv"
+    torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-3)
+    torch.testing.assert_close(actual_state, expected_state, rtol=2e-2, atol=2e-3)
+    for actual_input, expected_input in zip(inputs, baseline_inputs, strict=True):
+        torch.testing.assert_close(
+            actual_input.grad, expected_input.grad, rtol=5e-2, atol=5e-3
+        )

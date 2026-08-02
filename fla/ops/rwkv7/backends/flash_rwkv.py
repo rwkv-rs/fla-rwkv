@@ -87,8 +87,8 @@ class FlashRWKVBackend(BaseBackend):
             return False, "FlashRWKV requires contiguous inputs"
         if not all(tensor.is_cuda for tensor in tensors):
             return False, "FlashRWKV requires CUDA tensors"
-        if any(tensor.dtype != torch.float16 for tensor in tensors):
-            return False, "FlashRWKV requires float16 inputs"
+        if any(tensor.dtype not in {torch.float16, torch.bfloat16} for tensor in tensors):
+            return False, "FlashRWKV requires float16 or bfloat16 inputs"
         if any(tensor.device != r.device for tensor in tensors):
             return False, "FlashRWKV requires all inputs on the same CUDA device"
         if any(tensor.shape != r.shape for tensor in (w, k, a, b)) or v.shape[:3] != r.shape[:3]:
