@@ -7,6 +7,7 @@
 
 import importlib
 import inspect
+import json
 import os
 import subprocess
 import sys
@@ -478,6 +479,12 @@ def test_flash_rwkv_repository_canonicalization_accepts_exact_repo(url):
         "https://github.com/rwkv-rs/FlashRWKV.git#fragment",
         "https://github.com/rwkv-rſ/FlashRWKV.git",
         "https://github.com/rwkv-rs/FlashRWKV.git",
+        " https://github.com/rwkv-rs/FlashRWKV.git",
+        "\thttps://github.com/rwkv-rs/FlashRWKV.git",
+        "https://github.com/rwkv-rs/FlashRWKV.git\0",
+        "https://github.com/rwkv-rs/\nFlashRWKV.git",
+        "https://github.com/rwkv-rs/FlashRWKV.git\n",
+        "git@github.com:rwkv-rs/FlashRWKV.git\n",
     ],
 )
 def test_flash_rwkv_repository_canonicalization_rejects_foreign_source(url):
@@ -522,6 +529,36 @@ def test_flash_rwkv_repository_canonicalization_rejects_foreign_source(url):
             "hostile-repository",
             "must come from",
             "https://github.com/rwkv-rs%2FFlashRWKV.git",
+        ),
+        (
+            "hostile-repository",
+            "must come from",
+            " https://github.com/rwkv-rs/FlashRWKV.git",
+        ),
+        (
+            "hostile-repository",
+            "must come from",
+            "\thttps://github.com/rwkv-rs/FlashRWKV.git",
+        ),
+        (
+            "hostile-repository",
+            "must come from",
+            "https://github.com/rwkv-rs/FlashRWKV.git\0",
+        ),
+        (
+            "hostile-repository",
+            "must come from",
+            "https://github.com/rwkv-rs/\nFlashRWKV.git",
+        ),
+        (
+            "hostile-repository",
+            "must come from",
+            "https://github.com/rwkv-rs/FlashRWKV.git\n",
+        ),
+        (
+            "hostile-repository",
+            "must come from",
+            "git@github.com:rwkv-rs/FlashRWKV.git\n",
         ),
     ],
 )
@@ -586,7 +623,8 @@ direct_url = (
     {"url": source_root.as_uri(), "dir_info": {"editable": True}}
     if editable
     else {
-        "url": os.environ.get("CASE_SOURCE_URL") or "https://github.com/rwkv-rs/flashrwkv",
+        "url": json.loads(os.environ["CASE_SOURCE_URL_JSON"])
+        or "https://github.com/rwkv-rs/flashrwkv",
         "vcs_info": {
             "vcs": "git",
             "commit_id": (
@@ -642,7 +680,7 @@ else:
         CASE_ROOT=str(tmp_path),
         CASE_SCENARIO=scenario,
         EXPECTED_ERROR=expected,
-        CASE_SOURCE_URL=source_url or "",
+        CASE_SOURCE_URL_JSON=json.dumps(source_url or ""),
         CUDA_VISIBLE_DEVICES="",
     )
     subprocess.run(

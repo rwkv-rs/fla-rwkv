@@ -83,6 +83,8 @@ def _git_output(repository: Path, *arguments: str) -> str:
 
 def _canonical_repository(url: str) -> str | None:
     candidate = url.removeprefix("git+")
+    if any(ord(character) <= 0x20 or ord(character) == 0x7F for character in candidate):
+        return None
     if candidate in {
         "git@github.com:rwkv-rs/FlashRWKV.git",
         "ssh://git@github.com/rwkv-rs/FlashRWKV.git",
