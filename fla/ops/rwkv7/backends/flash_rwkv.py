@@ -29,7 +29,7 @@ from fla.ops.rwkv7.backends.provider import set_last_rwkv7_provider
 if TYPE_CHECKING:
     from fla.ops.cp import FLACPContext
 
-FLASH_RWKV_SOURCE_REVISION = "4ad12dc39de3709fb58a577667d45afd0c326737"
+FLASH_RWKV_SOURCE_REVISION = "69afbec2db9ffd3362962017a1fb36f2f333d1c6"
 
 
 @cache
