@@ -27,15 +27,35 @@ from fla.utils import device
 def _source_provenance() -> tuple[str, str]:
     distribution = importlib.metadata.distribution("flash-rwkv")
     direct_url = distribution.read_text("direct_url.json")
-    source = json.loads(direct_url)["url"] if direct_url else "unknown"
+    metadata = json.loads(direct_url) if direct_url else {}
+    source = metadata.get("url", "unknown")
+    revision = metadata.get("vcs_info", {}).get("commit_id", "unknown")
+    if revision != "unknown":
+        return source, revision
+
     revision = "unknown"
     if source.startswith("file://"):
         path = Path(source.removeprefix("file://"))
         with suppress(OSError, subprocess.CalledProcessError):
-            revision = subprocess.check_output(
-                ["git", "-C", str(path), "rev-parse", "HEAD"], text=True
-            ).strip()
+            revision = subprocess.check_output(["git", "-C", str(path), "rev-parse", "HEAD"], text=True).strip()
     return source, revision
+
+
+def _repository_revision() -> str:
+    repository = Path(__file__).resolve().parents[2]
+    return subprocess.check_output(["git", "-C", str(repository), "rev-parse", "HEAD"], text=True).strip()
+
+
+def _hardware(runner_label: str) -> dict[str, str | int | list[int]]:
+    properties = torch.cuda.get_device_properties(device)
+    return {
+        "runner_label": runner_label,
+        "device_name": properties.name,
+        "compute_capability": list(torch.cuda.get_device_capability(device)),
+        "total_memory_bytes": properties.total_memory,
+        "cuda_runtime": torch.version.cuda or "unknown",
+        "torch_version": torch.__version__,
+    }
 
 
 def _error_summary(actual: torch.Tensor, expected: torch.Tensor) -> dict[str, float]:
@@ -53,9 +73,7 @@ def _run(provider: str, inputs: list[torch.Tensor], state: torch.Tensor):
         os.environ["FLA_FLASH_RWKV"] = "1"
     else:
         os.environ.pop("FLA_FLASH_RWKV", None)
-    output, final_state = chunk_rwkv7(
-        *inputs, initial_state=state, output_final_state=True, chunk_size=16
-    )
+    output, final_state = chunk_rwkv7(*inputs, initial_state=state, output_final_state=True, chunk_size=16)
     return output, final_state, get_last_rwkv7_provider()
 
 
@@ -67,6 +85,11 @@ def main() -> None:
     parser.add_argument("--heads", type=int, default=2)
     parser.add_argument("--warmup", type=int, default=3)
     parser.add_argument("--iters", type=int, default=10)
+    parser.add_argument("--output", type=Path)
+    parser.add_argument("--runner-label", default=os.environ.get("RWKV7_BENCH_RUNNER_LABEL", "local"))
+    parser.add_argument("--pr-number", type=int)
+    parser.add_argument("--expected-source-revision")
+    parser.add_argument("--expected-provider-revision")
     args = parser.parse_args()
     if min(args.batch_size, args.tokens, args.heads, args.warmup, args.iters) <= 0:
         parser.error("shape, warmup, and iteration values must be positive")
@@ -80,6 +103,8 @@ def main() -> None:
 
     expected, expected_state, baseline_provider = _run("fla", inputs, state)
     actual, actual_state, selected_provider = _run("flash_rwkv", inputs, state)
+    torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-3)
+    torch.testing.assert_close(actual_state, expected_state, rtol=2e-2, atol=2e-3)
     for _ in range(args.warmup):
         _run("flash_rwkv", inputs, state)
     torch.cuda.synchronize()
@@ -90,15 +115,30 @@ def main() -> None:
         torch.cuda.synchronize()
         samples.append((time.perf_counter_ns() - start) / 1e6)
     quantiles = torch.tensor(samples).quantile(torch.tensor([0.1, 0.5, 0.9])).tolist()
-    source, revision = _source_provenance()
+    provider_source, provider_revision = _source_provenance()
+    source_revision = _repository_revision()
+    if args.expected_source_revision and source_revision != args.expected_source_revision:
+        raise RuntimeError(f"source revision mismatch: expected={args.expected_source_revision} actual={source_revision}")
+    if args.expected_provider_revision and provider_revision != args.expected_provider_revision:
+        raise RuntimeError(
+            f"FlashRWKV revision mismatch: expected={args.expected_provider_revision} actual={provider_revision}"
+        )
     report = {
+        "schema_version": 1,
+        "pr_number": args.pr_number,
+        "source_revision": source_revision,
+        "backend": selected_provider,
+        "reference_backend": baseline_provider,
         "selected_provider": selected_provider,
         "baseline_provider": baseline_provider,
         "flash_rwkv_version": importlib.metadata.version("flash-rwkv"),
-        "flash_rwkv_source": source,
-        "flash_rwkv_source_revision": revision,
-        "device": torch.cuda.get_device_name(),
-        "acceptance_scope": "local-diagnostic-not-pro6000-acceptance",
+        "flash_rwkv_source": provider_source,
+        "flash_rwkv_source_revision": provider_revision,
+        "hardware": _hardware(args.runner_label),
+        "measurement": {
+            "included": "chunk_rwkv7 adapter dispatch, FlashRWKV provider execution, and device synchronization",
+            "excluded": "input allocation, correctness baseline, warmup, provenance collection, and report serialization",
+        },
         "dtype": args.dtype,
         "head_size": 64,
         "B": args.batch_size,
@@ -113,7 +153,11 @@ def main() -> None:
     }
     if selected_provider != "flash_rwkv" or baseline_provider != "fla":
         raise RuntimeError(f"provider selection contract failed: {report}")
-    print(json.dumps(report, indent=2, sort_keys=True))
+    serialized = json.dumps(report, indent=2, sort_keys=True)
+    if args.output:
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        args.output.write_text(f"{serialized}\n", encoding="utf-8")
+    print(serialized)
 
 
 if __name__ == "__main__":
