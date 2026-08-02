@@ -23,10 +23,6 @@ from benchmarks.ops.registry import get_op
 from fla.ops.rwkv7 import chunk_rwkv7, get_last_rwkv7_provider, recurrent_rwkv7
 from fla.ops.rwkv7.backends import flash_rwkv as flash_rwkv_backend
 from fla.ops.rwkv7.backends.flash_rwkv import (
-    FLASH_RWKV_EVIDENCE_ARTIFACT_DIGEST,
-    FLASH_RWKV_EVIDENCE_ARTIFACT_ID,
-    FLASH_RWKV_EVIDENCE_REVISION,
-    FLASH_RWKV_EVIDENCE_RUN_ID,
     FLASH_RWKV_SOURCE_REVISION,
     FlashRWKVBackend,
     FlashRWKVProvenanceError,
@@ -151,6 +147,9 @@ def test_public_contract_owns_only_exact_recurrent_provider():
     import fla.ops.rwkv7
 
     implementation = inspect.getsource(FlashRWKVBackend.recurrent_rwkv7)
+    fallback = (Path(__file__).parents[2] / "fla/ops/rwkv7/recurrent.py").read_text(
+        encoding="utf-8"
+    )
     layer = (Path(__file__).parents[2] / "fla/layers/rwkv7.py").read_text(encoding="utf-8")
 
     assert fla.ops.recurrent_rwkv7 is recurrent_rwkv7
@@ -164,6 +163,7 @@ def test_public_contract_owns_only_exact_recurrent_provider():
     assert "chunk_dplr_delta_rule" not in implementation
     assert "pretrain_recurrent_fp32io16_forward" in implementation
     assert "rwkv7_recurrent_stateful" in implementation
+    assert "FlashRWKVBackend" not in fallback
     assert "if mode == 'recurrent':" in layer
     assert "return recurrent_rwkv7(" in layer
 
@@ -258,7 +258,11 @@ def test_rwkv7_layer_rejects_unknown_explicit_mode():
         ({"r": _tensor(dtype=torch.float32)}, {}, "FlashRWKV requires float16 or bfloat16 inputs"),
         ({"r": _tensor(shape=(1, 32, 128))}, {}, "FlashRWKV requires rank-4 [B, T, H, D] inputs"),
         ({"r": _tensor(contiguous=False)}, {}, "FlashRWKV requires contiguous inputs"),
-        ({"v": _tensor(size=128)}, {}, "FlashRWKV requires K=V=64, got K=64, V=128"),
+        (
+            {"v": _tensor(size=128)},
+            {},
+            "FlashRWKV requires equal K and V in {64, 128, 256}, got K=64, V=128",
+        ),
         ({"r": _tensor(device="cuda:1")}, {}, "FlashRWKV requires all inputs on the same CUDA device"),
         (
             {"r": _tensor(requires_grad=True)},
@@ -341,6 +345,22 @@ def test_flash_rwkv_verifier_accepts_supported_execution(requires_grad, packed):
         **args,
         cu_seqlens=cu_seqlens,
         initial_state=_tensor(dtype=torch.float32, shape=(1, 2, 64, 64)) if requires_grad else None,
+        output_final_state=True,
+    )
+
+    assert accepted is True
+    assert reason is None
+
+
+@pytest.mark.parametrize("head_size", [128, 256])
+def test_flash_rwkv_verifier_accepts_large_recurrent_heads(head_size):
+    inputs = {name: _tensor(size=head_size) for name in ("r", "w", "k", "v", "a", "b")}
+    accepted, reason = FlashRWKVBackend().recurrent_rwkv7_verifier(
+        **inputs,
+        initial_state=_tensor(
+            dtype=torch.float32,
+            shape=(1, 2, head_size, head_size),
+        ),
         output_final_state=True,
     )
 
@@ -766,13 +786,6 @@ def test_pinned_revision_matches_ci_contract():
 
     assert f'FLASH_RWKV_SOURCE_REVISION = "{FLASH_RWKV_SOURCE_REVISION}"' in script
     assert f"FLASH_RWKV_SOURCE_REVISION: {FLASH_RWKV_SOURCE_REVISION}" in workflow
-    assert f'FLASH_RWKV_EVIDENCE_REVISION = "{FLASH_RWKV_EVIDENCE_REVISION}"' in script
-    assert f"FLASH_RWKV_EVIDENCE_RUN_ID = {FLASH_RWKV_EVIDENCE_RUN_ID}" in script
-    assert f"FLASH_RWKV_EVIDENCE_ARTIFACT_ID = {FLASH_RWKV_EVIDENCE_ARTIFACT_ID}" in script
-    assert (
-        f'FLASH_RWKV_EVIDENCE_ARTIFACT_DIGEST = "{FLASH_RWKV_EVIDENCE_ARTIFACT_DIGEST}"'
-        in script
-    )
 
 
 def test_benchmark_result_has_complete_stable_fields():
@@ -991,7 +1004,7 @@ def test_public_recurrent_verifier_rejection_fails_closed(monkeypatch):
     monkeypatch.delenv("FLA_FLASH_RWKV", raising=False)
     monkeypatch.setattr(FlashRWKVBackend, "is_available", classmethod(lambda cls: True))
 
-    with pytest.raises(RuntimeError, match="does not expose the FLA safe_gate contract"):
+    with pytest.raises(RuntimeError, match="fallback is disabled"):
         recurrent_rwkv7(**_call_args(), safe_gate=True)
     assert get_last_rwkv7_provider() is None
 
@@ -1011,7 +1024,7 @@ x = torch.zeros(1, 1, 1, 64)
 try:
     recurrent_rwkv7(x, x, x, x, x, x)
 except RuntimeError as error:
-    assert "backend dispatch was bypassed" in str(error)
+    assert "fallback is disabled" in str(error)
 else:
     raise AssertionError("dispatch-disabled recurrent call did not fail closed")
 '''
@@ -1105,7 +1118,7 @@ def test_explicit_flash_rwkv_unavailable_fails_closed(monkeypatch):
     monkeypatch.setenv("FLA_FLASH_RWKV", "1")
     monkeypatch.setattr(FlashRWKVBackend, "is_available", classmethod(lambda cls: False))
 
-    with pytest.raises(RuntimeError, match="explicit backend 'flash_rwkv' is unavailable"):
+    with pytest.raises(RuntimeError, match="fallback is disabled"):
         recurrent_rwkv7(**_call_args())
     assert get_last_rwkv7_provider() is None
 
@@ -1136,11 +1149,15 @@ def test_failed_provider_call_clears_stale_success(monkeypatch):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-@pytest.mark.parametrize(("batch_size", "sequence_length"), [(1, 16), (2, 32)])
+@pytest.mark.parametrize(
+    ("batch_size", "sequence_length", "head_size"),
+    [(1, 16, 64), (2, 32, 64), (1, 2, 128), (1, 2, 256)],
+)
 def test_flash_rwkv_real_provider_matches_torch_training_cell(
     monkeypatch,
     batch_size,
     sequence_length,
+    head_size,
 ):
     import flash_rwkv
 
@@ -1152,7 +1169,7 @@ def test_flash_rwkv_real_provider_matches_torch_training_cell(
                 batch_size,
                 sequence_length,
                 1,
-                64,
+                head_size,
                 device="cuda",
                 dtype=dtype,
             )
@@ -1165,7 +1182,12 @@ def test_flash_rwkv_real_provider_matches_torch_training_cell(
     inputs[1] = torch.full_like(inputs[1], -0.1, requires_grad=True)
     initial_state = (
         torch.randn(
-            batch_size, 1, 64, 64, device="cuda", dtype=torch.float32
+            batch_size,
+            1,
+            head_size,
+            head_size,
+            device="cuda",
+            dtype=torch.float32,
         )
         * 0.01
     ).requires_grad_()
@@ -1215,18 +1237,23 @@ def test_flash_rwkv_real_provider_matches_torch_training_cell(
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 @pytest.mark.parametrize(
-    ("mode", "state_dtype"),
-    [("fp32io16", torch.float32), ("fp16", torch.float16)],
+    ("mode", "state_dtype", "head_size"),
+    [
+        (mode, state_dtype, head_size)
+        for mode, state_dtype in (("fp32io16", torch.float32), ("fp16", torch.float16))
+        for head_size in (64, 128, 256)
+    ],
 )
 def test_flash_rwkv_real_provider_packed_state_pool_contract(
     monkeypatch,
     mode,
     state_dtype,
+    head_size,
 ):
     import flash_rwkv
 
     torch.manual_seed(19)
-    shape = (1, 3, 1, 64)
+    shape = (1, 3, 1, head_size)
     inputs = [
         (torch.randn(shape, device="cuda", dtype=torch.float16) * 0.02).contiguous()
         for _ in range(6)
@@ -1235,7 +1262,15 @@ def test_flash_rwkv_real_provider_packed_state_pool_contract(
     cu_seqlens = torch.tensor([0, 2, 3], device="cuda", dtype=torch.int32)
     state_indices = torch.tensor([3, 1], device="cuda", dtype=torch.int32)
     initial_pool = (
-        torch.randn(5, 1, 64, 64, device="cuda", dtype=torch.float32) * 0.01
+        torch.randn(
+            5,
+            1,
+            head_size,
+            head_size,
+            device="cuda",
+            dtype=torch.float32,
+        )
+        * 0.01
     ).to(state_dtype)
     expected_output, expected_pool = _torch_rwkv7_packed(
         *inputs,

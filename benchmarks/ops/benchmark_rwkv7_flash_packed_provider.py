@@ -26,14 +26,16 @@ import torch
 
 from fla.ops.rwkv7 import get_last_rwkv7_provider, recurrent_rwkv7
 from fla.ops.rwkv7.backends.flash_rwkv import (
-    FLASH_RWKV_EVIDENCE_ARTIFACT_DIGEST,
-    FLASH_RWKV_EVIDENCE_ARTIFACT_ID,
-    FLASH_RWKV_EVIDENCE_REVISION,
-    FLASH_RWKV_EVIDENCE_RUN_ID,
     FLASH_RWKV_SOURCE_REVISION,
     validate_flash_rwkv_installation,
 )
 
+FLASH_RWKV_EVIDENCE_REVISION = "71dd68897ffa79b727409b299ddea2c0eaba2563"
+FLASH_RWKV_EVIDENCE_RUN_ID = 30751092211
+FLASH_RWKV_EVIDENCE_ARTIFACT_ID = 8834636910
+FLASH_RWKV_EVIDENCE_ARTIFACT_DIGEST = (
+    "sha256:1640178254d96db98c60adf630372d60be7e797a21896a33613da69cc8823542"
+)
 HEAD_SIZE = 64
 PROFILES: dict[str, tuple[int, ...]] = {
     "decode_b320": (1,) * 320,
