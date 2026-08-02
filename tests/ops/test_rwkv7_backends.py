@@ -19,7 +19,8 @@ import pytest
 import torch
 
 from benchmarks.ops.benchmark_rwkv7_flash_provider import _format_result
-from fla.ops.rwkv7 import get_last_rwkv7_provider, recurrent_rwkv7
+from benchmarks.ops.registry import get_op
+from fla.ops.rwkv7 import chunk_rwkv7, get_last_rwkv7_provider, recurrent_rwkv7
 from fla.ops.rwkv7.backends import flash_rwkv as flash_rwkv_backend
 from fla.ops.rwkv7.backends.flash_rwkv import (
     FLASH_RWKV_EVIDENCE_ARTIFACT_DIGEST,
@@ -109,6 +110,35 @@ def test_public_stateful_signature_matches_vllm_consumer_contract():
     )
 
 
+def test_public_chunk_api_and_benchmark_registry_identity_are_preserved():
+    import fla.ops
+    import fla.ops.rwkv7
+
+    assert fla.ops.chunk_rwkv7 is chunk_rwkv7
+    assert fla.ops.rwkv7.chunk_rwkv7 is chunk_rwkv7
+    assert tuple(inspect.signature(chunk_rwkv7).parameters) == (
+        "r",
+        "w",
+        "k",
+        "v",
+        "a",
+        "b",
+        "scale",
+        "initial_state",
+        "output_final_state",
+        "cu_seqlens",
+        "cu_seqlens_cpu",
+        "safe_gate",
+        "chunk_size",
+        "disable_recompute",
+        "cp_context",
+        "kwargs",
+    )
+    benchmark = get_op("chunk_rwkv7")
+    assert benchmark.import_path == "fla.ops.rwkv7"
+    assert benchmark.extra_kwargs == {"safe_gate": True, "chunk_size": 64}
+
+
 def test_flash_rwkv_verifier_does_not_materialize_device_metadata_on_host():
     source = inspect.getsource(FlashRWKVBackend.recurrent_rwkv7_verifier)
 
@@ -125,6 +155,8 @@ def test_public_contract_owns_only_exact_recurrent_provider():
 
     assert fla.ops.recurrent_rwkv7 is recurrent_rwkv7
     assert fla.ops.rwkv7.recurrent_rwkv7 is recurrent_rwkv7
+    assert fla.ops.chunk_rwkv7 is chunk_rwkv7
+    assert fla.ops.rwkv7.chunk_rwkv7 is chunk_rwkv7
     assert not hasattr(fla.ops, "chunk_rwkv7_reference")
     assert not hasattr(fla.ops.rwkv7, "chunk_rwkv7_reference")
     assert 'algorithm="recurrent"' in implementation
@@ -171,7 +203,7 @@ def test_rwkv7_layer_constructor_rejects_unknown_mode():
     ("mode", "selected"),
     [
         ("recurrent", "recurrent"),
-        ("chunk", "explicit_chunk_reference"),
+        ("chunk", "chunk"),
         ("fused_recurrent", "fused_recurrent"),
     ],
 )
@@ -188,7 +220,7 @@ def test_rwkv7_layer_explicit_mode_selects_exact_operator(monkeypatch, mode, sel
         return run
 
     monkeypatch.setattr(layer, "recurrent_rwkv7", implementation("recurrent"))
-    monkeypatch.setattr(layer, "chunk_rwkv7_reference", implementation("explicit_chunk_reference"))
+    monkeypatch.setattr(layer, "chunk_rwkv7", implementation("chunk"))
     monkeypatch.setattr(layer, "fused_mul_recurrent_rwkv7", implementation("fused_recurrent"))
     tensor = torch.ones(1, 1, 1, 1)
 
@@ -430,7 +462,34 @@ def test_flash_rwkv_verifier_accepts_mixed_wave_noncontiguous_slots(mode, state_
     assert reason is None
 
 
-def test_flash_rwkv_availability_revalidates_public_provenance(monkeypatch):
+def test_recurrent_dispatch_validates_public_provenance_once(monkeypatch):
+    validation_calls = []
+    provider_calls = []
+    fake_provider = SimpleNamespace(
+        rwkv7=lambda *args, **kwargs: provider_calls.append((args, kwargs)) or ("output", "state")
+    )
+
+    monkeypatch.setattr(
+        flash_rwkv_backend,
+        "_flash_rwkv_preflight_result",
+        flash_rwkv_backend._FLASH_RWKV_PREFLIGHT_UNSET,
+    )
+    monkeypatch.setattr(
+        flash_rwkv_backend,
+        "validate_flash_rwkv_installation",
+        lambda: validation_calls.append(True) or object(),
+    )
+    monkeypatch.setitem(sys.modules, "flash_rwkv", fake_provider)
+    monkeypatch.setenv("FLA_FLASH_RWKV", "1")
+
+    for _ in range(5):
+        assert recurrent_rwkv7(**_call_args(), output_final_state=True) == ("output", "state")
+
+    assert len(validation_calls) == 1
+    assert len(provider_calls) == 5
+
+
+def test_flash_rwkv_explicit_preflight_refresh_revalidates_editable_provider(monkeypatch):
     results = [object(), FlashRWKVProvenanceError("dirty editable checkout")]
 
     def validate():
@@ -439,9 +498,17 @@ def test_flash_rwkv_availability_revalidates_public_provenance(monkeypatch):
             raise result
         return result
 
+    monkeypatch.setattr(
+        flash_rwkv_backend,
+        "_flash_rwkv_preflight_result",
+        flash_rwkv_backend._FLASH_RWKV_PREFLIGHT_UNSET,
+    )
     monkeypatch.setattr(flash_rwkv_backend, "validate_flash_rwkv_installation", validate)
 
+    flash_rwkv_backend.preflight_flash_rwkv_installation()
     assert FlashRWKVBackend.is_available() is True
+    with pytest.raises(FlashRWKVProvenanceError, match="dirty editable checkout"):
+        flash_rwkv_backend.preflight_flash_rwkv_installation(refresh=True)
     assert FlashRWKVBackend.is_available() is False
     assert results == []
 
@@ -667,8 +734,9 @@ if editable:
         return responses[arguments]
     backend._git_output = git_output
 
+backend._flash_rwkv_preflight_result = backend._FLASH_RWKV_PREFLIGHT_UNSET
 try:
-    backend.validate_flash_rwkv_installation()
+    backend.preflight_flash_rwkv_installation()
 except backend.FlashRWKVProvenanceError as error:
     if os.environ["EXPECTED_ERROR"] not in str(error):
         raise
