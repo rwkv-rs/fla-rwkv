@@ -6,6 +6,7 @@
 #   https://github.com/fla-org/flash-linear-attention/graphs/contributors
 
 import importlib
+import inspect
 import os
 import subprocess
 import sys
@@ -57,6 +58,14 @@ def test_flash_rwkv_backend_requires_opt_in(monkeypatch):
 
     monkeypatch.setenv("FLA_FLASH_RWKV", "1")
     assert FlashRWKVBackend.is_enabled() is True
+
+
+def test_public_stateful_signature_matches_vllm_consumer_contract():
+    required = {"initial_state", "output_final_state", "cu_seqlens", "state_indices", "mode"}
+
+    assert required <= inspect.signature(chunk_rwkv7).parameters.keys()
+    assert required <= inspect.signature(FlashRWKVBackend.chunk_rwkv7).parameters.keys()
+    assert required <= inspect.signature(FlashRWKVBackend.chunk_rwkv7_verifier).parameters.keys()
 
 
 @pytest.mark.parametrize(
@@ -156,6 +165,80 @@ def test_flash_rwkv_verifier_accepts_packed_state_count_and_cpu_offsets():
     assert reason is None
 
 
+@pytest.mark.parametrize(
+    ("state_indices", "state_shape", "mode", "state_dtype", "reason"),
+    [
+        (
+            torch.tensor([3, 3], dtype=torch.int32),
+            (4, 2, 64, 64),
+            "fp32io16",
+            torch.float32,
+            "FlashRWKV state_indices must be unique within one call",
+        ),
+        (
+            torch.tensor([4, 1], dtype=torch.int32),
+            (4, 2, 64, 64),
+            "fp32io16",
+            torch.float32,
+            "FlashRWKV state_indices entries must be within the state pool",
+        ),
+        (
+            torch.tensor([3, 1], dtype=torch.int32),
+            (4, 2, 32, 64),
+            "fp32io16",
+            torch.float32,
+            "FlashRWKV initial_state must have shape [N, H, K, V] matching the input layout",
+        ),
+        (
+            torch.tensor([3, 1], dtype=torch.int32),
+            (4, 2, 64, 64),
+            "fp16",
+            torch.float32,
+            "FlashRWKV stateful fp16 requires a torch.float16 state pool",
+        ),
+    ],
+)
+def test_flash_rwkv_verifier_rejects_invalid_state_pool_slots(
+    state_indices,
+    state_shape,
+    mode,
+    state_dtype,
+    reason,
+):
+    accepted, actual_reason = FlashRWKVBackend().chunk_rwkv7_verifier(
+        **{
+            name: _tensor(shape=(1, 3, 2, 64))
+            for name in ("r", "w", "k", "v", "a", "b")
+        },
+        cu_seqlens=torch.tensor([0, 2, 3], dtype=torch.int32),
+        state_indices=state_indices,
+        initial_state=_tensor(dtype=state_dtype, shape=state_shape),
+        output_final_state=True,
+        mode=mode,
+    )
+
+    assert accepted is False
+    assert actual_reason == reason
+
+
+@pytest.mark.parametrize(("mode", "state_dtype"), [("fp16", torch.float16), ("fp32io16", torch.float32)])
+def test_flash_rwkv_verifier_accepts_mixed_wave_noncontiguous_slots(mode, state_dtype):
+    accepted, reason = FlashRWKVBackend().chunk_rwkv7_verifier(
+        **{
+            name: _tensor(shape=(1, 3, 2, 64))
+            for name in ("r", "w", "k", "v", "a", "b")
+        },
+        cu_seqlens=torch.tensor([0, 2, 3], dtype=torch.int32),
+        state_indices=torch.tensor([3, 1], dtype=torch.int32),
+        initial_state=_tensor(dtype=state_dtype, shape=(4, 2, 64, 64)),
+        output_final_state=True,
+        mode=mode,
+    )
+
+    assert accepted is True
+    assert reason is None
+
+
 def test_flash_rwkv_availability_checks_version_and_public_api(monkeypatch):
     def compatible_rwkv7(
         r,
@@ -175,7 +258,27 @@ def test_flash_rwkv_availability_checks_version_and_public_api(monkeypatch):
     ):
         del r, log_decay, k, v, a, b, scale, initial_state, output_final_state, cu_seqlens, mode, algorithm, chunk_size
 
-    module = SimpleNamespace(__version__="0.1.0", rwkv7=compatible_rwkv7)
+    def compatible_rwkv7_recurrent_stateful(
+        r,
+        log_decay,
+        k,
+        v,
+        a,
+        b,
+        *,
+        state_pool,
+        cu_seqlens,
+        state_indices,
+        scale,
+        mode,
+    ):
+        del r, log_decay, k, v, a, b, state_pool, cu_seqlens, state_indices, scale, mode
+
+    module = SimpleNamespace(
+        __version__="0.1.0",
+        rwkv7=compatible_rwkv7,
+        rwkv7_recurrent_stateful=compatible_rwkv7_recurrent_stateful,
+    )
     monkeypatch.setattr(importlib, "import_module", lambda name: module)
     monkeypatch.setattr(
         flash_rwkv_backend,
@@ -188,6 +291,9 @@ def test_flash_rwkv_availability_checks_version_and_public_api(monkeypatch):
     assert FlashRWKVBackend.is_available() is False
     module.__version__ = "0.1.0"
     module.rwkv7 = lambda: None
+    assert FlashRWKVBackend.is_available() is False
+    module.rwkv7 = compatible_rwkv7
+    module.rwkv7_recurrent_stateful = lambda: None
     assert FlashRWKVBackend.is_available() is False
 
 
@@ -210,7 +316,27 @@ def test_flash_rwkv_availability_rejects_unpinned_revision(monkeypatch):
     ):
         del r, log_decay, k, v, a, b, scale, initial_state, output_final_state, cu_seqlens, mode, algorithm, chunk_size
 
-    module = SimpleNamespace(__version__="0.1.0", rwkv7=compatible_rwkv7)
+    def compatible_rwkv7_recurrent_stateful(
+        r,
+        log_decay,
+        k,
+        v,
+        a,
+        b,
+        *,
+        state_pool,
+        cu_seqlens,
+        state_indices,
+        scale,
+        mode,
+    ):
+        del r, log_decay, k, v, a, b, state_pool, cu_seqlens, state_indices, scale, mode
+
+    module = SimpleNamespace(
+        __version__="0.1.0",
+        rwkv7=compatible_rwkv7,
+        rwkv7_recurrent_stateful=compatible_rwkv7_recurrent_stateful,
+    )
     monkeypatch.setattr(importlib, "import_module", lambda name: module)
     monkeypatch.setattr(flash_rwkv_backend, "_installed_flash_rwkv_revision", lambda: "0" * 40)
 
@@ -345,6 +471,82 @@ def test_chunk_rwkv7_dispatches_to_flash_provider(monkeypatch):
     assert get_last_rwkv7_provider() == "flash_rwkv"
     assert calls[0][1]["algorithm"] == "chunk"
     assert calls[0][1]["mode"] == "fp32io16"
+
+
+@pytest.mark.parametrize(("mode", "state_dtype"), [("fp16", torch.float16), ("fp32io16", torch.float32)])
+def test_public_chunk_rwkv7_runs_mixed_wave_in_place_without_fallback(
+    monkeypatch,
+    mode,
+    state_dtype,
+):
+    calls = []
+    state_pool = _tensor(dtype=state_dtype, shape=(4, 2, 64, 64))
+    state_pool.updated_slots = None
+    cu_seqlens = torch.tensor([0, 2, 3], dtype=torch.int32)
+    state_indices = torch.tensor([3, 1], dtype=torch.int32)
+
+    def rwkv7_recurrent_stateful(*args, **kwargs):
+        calls.append((args, kwargs))
+        kwargs["state_pool"].updated_slots = tuple(kwargs["state_indices"].tolist())
+        return "mixed-wave-output"
+
+    fake_provider = SimpleNamespace(rwkv7_recurrent_stateful=rwkv7_recurrent_stateful)
+    monkeypatch.setitem(sys.modules, "flash_rwkv", fake_provider)
+    monkeypatch.delenv("FLA_FLASH_RWKV", raising=False)
+    monkeypatch.setattr(FlashRWKVBackend, "is_available", classmethod(lambda cls: True))
+
+    inputs = {
+        name: _tensor(shape=(1, 3, 2, 64))
+        for name in ("r", "w", "k", "v", "a", "b")
+    }
+    output, final_state = chunk_rwkv7(
+        **inputs,
+        initial_state=state_pool,
+        output_final_state=True,
+        cu_seqlens=cu_seqlens,
+        state_indices=state_indices,
+        mode=mode,
+    )
+
+    assert output == "mixed-wave-output"
+    assert final_state is state_pool
+    assert state_pool.updated_slots == (3, 1)
+    assert get_last_rwkv7_provider() == "flash_rwkv"
+    assert len(calls) == 1
+    kwargs = calls[0][1]
+    assert kwargs["state_pool"] is state_pool
+    assert kwargs["cu_seqlens"] is cu_seqlens
+    assert kwargs["state_indices"] is state_indices
+    assert kwargs["mode"] == mode
+
+
+def test_public_stateful_provider_failure_clears_telemetry(monkeypatch):
+    def fail(*args, **kwargs):
+        raise RuntimeError("stateful provider failed")
+
+    monkeypatch.setitem(
+        sys.modules,
+        "flash_rwkv",
+        SimpleNamespace(rwkv7_recurrent_stateful=fail),
+    )
+    monkeypatch.delenv("FLA_FLASH_RWKV", raising=False)
+    monkeypatch.setattr(FlashRWKVBackend, "is_available", classmethod(lambda cls: True))
+    set_provider = importlib.import_module("fla.ops.rwkv7.backends.provider").set_last_rwkv7_provider
+    set_provider("flash_rwkv")
+
+    with pytest.raises(RuntimeError, match="stateful provider failed"):
+        chunk_rwkv7(
+            **{
+                name: _tensor(shape=(1, 3, 2, 64))
+                for name in ("r", "w", "k", "v", "a", "b")
+            },
+            initial_state=_tensor(dtype=torch.float32, shape=(4, 2, 64, 64)),
+            output_final_state=True,
+            cu_seqlens=torch.tensor([0, 2, 3], dtype=torch.int32),
+            state_indices=torch.tensor([3, 1], dtype=torch.int32),
+            mode="fp32io16",
+        )
+    assert get_last_rwkv7_provider() is None
 
 
 def test_explicit_flash_rwkv_unavailable_fails_closed(monkeypatch):
