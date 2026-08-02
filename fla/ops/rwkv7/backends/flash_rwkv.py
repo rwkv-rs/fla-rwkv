@@ -31,7 +31,11 @@ class FlashRWKVBackend(BaseBackend):
     package_name = "flash_rwkv"
     env_var = "FLA_FLASH_RWKV"
     default_enable = False
+    fail_closed_on_explicit_enable = True
     priority = 3
+
+    def on_explicit_failure(self) -> None:
+        set_last_rwkv7_provider(None)
 
     @classmethod
     def is_available(cls) -> bool:

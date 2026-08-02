@@ -196,17 +196,13 @@ def test_chunk_rwkv7_dispatches_to_flash_provider(monkeypatch):
     assert calls[0][1]["mode"] == "fp32io16"
 
 
-def test_chunk_rwkv7_falls_back_to_fla(monkeypatch):
-    chunk_module = importlib.import_module("fla.ops.rwkv7.chunk")
-    expected = ("fla-output", "fla-state")
+def test_explicit_flash_rwkv_unavailable_fails_closed(monkeypatch):
     monkeypatch.setenv("FLA_FLASH_RWKV", "1")
     monkeypatch.setattr(FlashRWKVBackend, "is_available", classmethod(lambda cls: False))
-    monkeypatch.setattr(chunk_module, "chunk_dplr_delta_rule", lambda **kwargs: expected)
 
-    actual = chunk_rwkv7(**_call_args())
-
-    assert actual == expected
-    assert get_last_rwkv7_provider() == "fla"
+    with pytest.raises(RuntimeError, match="explicit backend 'flash_rwkv' is unavailable"):
+        chunk_rwkv7(**_call_args())
+    assert get_last_rwkv7_provider() is None
 
 
 def test_failed_provider_call_clears_stale_success(monkeypatch):
@@ -226,28 +222,42 @@ def test_failed_provider_call_clears_stale_success(monkeypatch):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-def test_flash_rwkv_real_provider_matches_fla_training_cell(monkeypatch, dtype):
+@pytest.mark.parametrize(("batch_size", "sequence_length"), [(1, 16), (2, 32)])
+def test_flash_rwkv_real_provider_matches_torch_training_cell(
+    monkeypatch,
+    batch_size,
+    sequence_length,
+):
     torch.manual_seed(7)
+    dtype = torch.bfloat16
     inputs = [
-        (torch.randn(1, 16, 1, 64, device="cuda", dtype=dtype) * 0.02)
+        (
+            torch.randn(
+                batch_size,
+                sequence_length,
+                1,
+                64,
+                device="cuda",
+                dtype=dtype,
+            )
+            * 0.02
+        )
         .contiguous()
         .requires_grad_()
         for _ in range(6)
     ]
     inputs[1] = torch.full_like(inputs[1], -0.1, requires_grad=True)
-    initial_state = torch.zeros(
-        1, 1, 64, 64, device="cuda", dtype=torch.float32, requires_grad=True
-    )
+    initial_state = (
+        torch.randn(
+            batch_size, 1, 64, 64, device="cuda", dtype=torch.float32
+        )
+        * 0.01
+    ).requires_grad_()
 
-    monkeypatch.delenv("FLA_FLASH_RWKV", raising=False)
     baseline_inputs = [tensor.detach().clone().requires_grad_() for tensor in inputs]
     baseline_state = initial_state.detach().clone().requires_grad_()
-    expected, expected_state = chunk_rwkv7(
-        *baseline_inputs,
-        initial_state=baseline_state,
-        output_final_state=True,
-        chunk_size=16,
+    expected, expected_state = _torch_rwkv7(
+        *baseline_inputs, initial_state=baseline_state
     )
     (expected.float().square().mean() + expected_state.square().mean()).backward()
 
@@ -261,9 +271,33 @@ def test_flash_rwkv_real_provider_matches_fla_training_cell(monkeypatch, dtype):
     (actual.float().square().mean() + actual_state.square().mean()).backward()
 
     assert get_last_rwkv7_provider() == "flash_rwkv"
+    assert actual.dtype == torch.bfloat16
+    assert actual_state.dtype == torch.float32
     torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-3)
     torch.testing.assert_close(actual_state, expected_state, rtol=2e-2, atol=2e-3)
     for actual_input, expected_input in zip(inputs, baseline_inputs, strict=True):
         torch.testing.assert_close(
             actual_input.grad, expected_input.grad, rtol=5e-2, atol=5e-3
         )
+    torch.testing.assert_close(
+        initial_state.grad, baseline_state.grad, rtol=5e-2, atol=5e-3
+    )
+
+
+def _torch_rwkv7(r, w, k, v, a, b, *, initial_state, scale=1.0):
+    state = initial_state.float()
+    outputs = []
+    for index in range(r.shape[1]):
+        state = (
+            w[:, index].float().exp().unsqueeze(-1) * state
+            + b[:, index].float().unsqueeze(-1)
+            * torch.einsum("bhk,bhkv->bhv", a[:, index].float(), state).unsqueeze(-2)
+            + k[:, index].float().unsqueeze(-1)
+            * v[:, index].float().unsqueeze(-2)
+        )
+        outputs.append(
+            torch.einsum(
+                "bhk,bhkv->bhv", r[:, index].float() * scale, state
+            ).to(v.dtype)
+        )
+    return torch.stack(outputs, dim=1), state
