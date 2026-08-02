@@ -498,6 +498,38 @@ def pretrain_head_l2wrap_ce_bf16(
     )
 
 
+def rl_infctx_chunk_fp32io16_factor_recompute(
+    r: torch.Tensor,
+    log_decay: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    *,
+    scale: float = 1.0,
+    initial_state: torch.Tensor | None = None,
+    output_final_state: bool = True,
+    cu_seqlens: torch.Tensor | None = None,
+    state_indices: torch.Tensor | None = None,
+    chunk_size: int = 16,
+):
+    return _invoke(
+        "rl_infctx_chunk_fp32io16_factor_recompute",
+        r,
+        log_decay,
+        k,
+        v,
+        a,
+        b,
+        scale=scale,
+        initial_state=initial_state,
+        output_final_state=output_final_state,
+        cu_seqlens=cu_seqlens,
+        state_indices=state_indices,
+        chunk_size=chunk_size,
+    )
+
+
 def infer_tmix_mix6_fp16(
     x: torch.Tensor,
     shift_state: torch.Tensor,

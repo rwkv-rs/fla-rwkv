@@ -35,7 +35,7 @@ from fla.ops.rwkv7.backends.provider import (
 if TYPE_CHECKING:
     from fla.ops.cp import FLACPContext
 
-FLASH_RWKV_SOURCE_REVISION = "9fe104c8c748771ba981058a6efcd95c150e453d"
+FLASH_RWKV_SOURCE_REVISION = "c2566924c567b4cff9f7327daf6e61b57fef210b"
 FLASH_RWKV_REPOSITORY = "https://github.com/rwkv-rs/FlashRWKV.git"
 FLASH_RWKV_PUBLIC_OPERATORS = (
     "decay_logits_to_log_decay",
@@ -58,6 +58,7 @@ FLASH_RWKV_PUBLIC_OPERATORS = (
     "pretrain_tmix_lnx_rkvres_xg_bf16",
     "pretrain_tmix_mix6_bf16",
     "pretrain_tmix_vres_gate_bf16",
+    "rl_infctx_chunk_fp32io16_factor_recompute",
     "rwkv7",
     "rwkv7_from_decay_logits",
     "rwkv7_recurrent_stateful",
