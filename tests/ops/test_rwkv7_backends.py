@@ -706,6 +706,9 @@ module = SimpleNamespace(
     pretrain_recurrent_fp32io16_forward=pretrain_recurrent_fp32io16_forward,
     validate_packed_metadata_strict=lambda *args, **kwargs: None,
 )
+for operator in backend.FLASH_RWKV_PUBLIC_OPERATORS:
+    if not hasattr(module, operator):
+        setattr(module, operator, lambda *args, **kwargs: None)
 direct_url = (
     {"url": source_root.as_uri(), "dir_info": {"editable": True}}
     if editable

@@ -32,7 +32,7 @@ from .parallax import parallel_parallax
 from .path_attn import parallel_path_attn
 from .retention import chunk_retention, fused_chunk_retention, fused_recurrent_retention, parallel_retention
 from .rwkv6 import chunk_rwkv6, fused_recurrent_rwkv6
-from .rwkv7 import chunk_rwkv7, fused_recurrent_rwkv7, recurrent_rwkv7
+from .rwkv7 import chunk_rwkv7, flash_rwkv, fused_recurrent_rwkv7, recurrent_rwkv7
 from .simple_gla import chunk_simple_gla, fused_chunk_simple_gla, fused_recurrent_simple_gla, parallel_simple_gla
 from .wall_attn import parallel_wall_attn, parallel_wall_attn_decode
 
@@ -55,6 +55,7 @@ __all__ = [
     'chunk_rwkv6',
     'chunk_rwkv7',
     'chunk_simple_gla',
+    'flash_rwkv',
     'fused_attnres',
     'fused_chunk_based',
     'fused_chunk_delta_rule',
