@@ -5,13 +5,12 @@
 # For a list of all contributors, visit:
 #   https://github.com/fla-org/flash-linear-attention/graphs/contributors
 
-from .backends.provider import get_last_rwkv7_provider
-from .chunk import chunk_rwkv7
-from .fused_recurrent import fused_mul_recurrent_rwkv7, fused_recurrent_rwkv7
+"""RWKV7 backends."""
 
-__all__ = [
-    'chunk_rwkv7',
-    'fused_mul_recurrent_rwkv7',
-    'fused_recurrent_rwkv7',
-    'get_last_rwkv7_provider',
-]
+from fla.ops.backends import BackendRegistry, dispatch
+from fla.ops.rwkv7.backends.flash_rwkv import FlashRWKVBackend
+
+rwkv7_registry = BackendRegistry('rwkv7')
+rwkv7_registry.register(FlashRWKVBackend())
+
+__all__ = ['dispatch', 'rwkv7_registry']
