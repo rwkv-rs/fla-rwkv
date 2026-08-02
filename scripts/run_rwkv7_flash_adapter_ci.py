@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import re
 import subprocess
@@ -22,6 +23,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 PRO6000_RUNNER_LABEL = "rwkv-sha-pro6000x8"
 FLASH_RWKV_SOURCE_REVISION = "866aafd2eed146b0eda1ce03444009ae030f89e3"
 REVISION_PATTERN = re.compile(r"^[0-9a-f]{40}$")
+RESULT_FIELDS = ("label", "B", "T", "iters", "p10_ms", "p50_ms", "p90_ms", "tok_s_p50")
 
 
 def _revision() -> str:
@@ -113,6 +115,20 @@ def _validate_benchmark(
         raise RuntimeError("benchmark artifact lacks the required latency percentiles")
     if report.get("tokens_per_second", 0) <= 0:
         raise RuntimeError("benchmark artifact has invalid throughput")
+    missing_result_fields = tuple(field for field in RESULT_FIELDS if field not in report)
+    if missing_result_fields:
+        raise RuntimeError(f"benchmark artifact lacks RESULT fields: {missing_result_fields}")
+    for field in ("p10_ms", "p50_ms", "p90_ms", "tok_s_p50"):
+        value = report[field]
+        if not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
+            raise RuntimeError(f"benchmark artifact has invalid RESULT field {field}")
+    if (
+        report["p10_ms"] != report["latency_ms"]["p10"]
+        or report["p50_ms"] != report["latency_ms"]["p50"]
+        or report["p90_ms"] != report["latency_ms"]["p90"]
+        or report["tok_s_p50"] != report["tokens_per_second"]
+    ):
+        raise RuntimeError("benchmark artifact RESULT fields disagree with compatibility fields")
     for error_name in ("output_error", "final_state_error"):
         if set(report.get(error_name, {})) != {"max_abs", "mean_abs", "max_rel"}:
             raise RuntimeError(f"benchmark artifact lacks {error_name}")

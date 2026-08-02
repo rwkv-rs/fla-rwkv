@@ -23,6 +23,24 @@ import torch
 from fla.ops.rwkv7 import chunk_rwkv7, get_last_rwkv7_provider
 from fla.utils import device
 
+RESULT_FIELDS = ("label", "B", "T", "iters", "p10_ms", "p50_ms", "p90_ms", "tok_s_p50")
+
+
+def _format_result(row: dict[str, object]) -> str:
+    missing = tuple(field for field in RESULT_FIELDS if field not in row)
+    if missing:
+        raise ValueError(f"benchmark row is missing RESULT fields: {missing}")
+
+    def metric(field: str) -> str:
+        return str(round(float(row[field]), 6))
+
+    return (
+        f"RESULT B={row['B']} T={row['T']} iters={row['iters']} "
+        f"p10_ms={metric('p10_ms')} p50_ms={metric('p50_ms')} "
+        f"p90_ms={metric('p90_ms')} tok_s_p50={metric('tok_s_p50')} "
+        f"label={row['label']}"
+    )
+
 
 def _source_provenance() -> tuple[str, str]:
     distribution = importlib.metadata.distribution("flash-rwkv")
@@ -125,6 +143,7 @@ def main() -> None:
         )
     report = {
         "schema_version": 1,
+        "label": f"flash-rwkv-{args.dtype}-B{args.batch_size}T{args.tokens}",
         "pr_number": args.pr_number,
         "source_revision": source_revision,
         "backend": selected_provider,
@@ -146,6 +165,10 @@ def main() -> None:
         "H": args.heads,
         "warmup": args.warmup,
         "iters": args.iters,
+        "p10_ms": quantiles[0],
+        "p50_ms": quantiles[1],
+        "p90_ms": quantiles[2],
+        "tok_s_p50": args.batch_size * args.tokens / (quantiles[1] / 1000),
         "latency_ms": {"p10": quantiles[0], "p50": quantiles[1], "p90": quantiles[2]},
         "tokens_per_second": args.batch_size * args.tokens / (quantiles[1] / 1000),
         "output_error": _error_summary(actual, expected),
@@ -157,6 +180,7 @@ def main() -> None:
     if args.output:
         args.output.parent.mkdir(parents=True, exist_ok=True)
         args.output.write_text(f"{serialized}\n", encoding="utf-8")
+    print(_format_result(report))
     print(serialized)
 
 
