@@ -280,3 +280,96 @@ def test_flash_inference_eligibility_excludes_packed_and_training_paths(monkeypa
 
     monkeypatch.setattr(torch, "is_grad_enabled", lambda: True)
     assert not can_use_flash_rwkv_inference(tensor, head_dim=64)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_real_provider_standard_attention_inference_matches_unfused_path(monkeypatch):
+    import fla.layers.rwkv7 as layer_module
+    from fla.ops.rwkv7.inference import can_use_flash_rwkv_inference
+
+    torch.manual_seed(2611)
+    layer = layer_module.RWKV7Attention(
+        hidden_size=128,
+        head_dim=64,
+        layer_idx=1,
+        value_dim=128,
+        num_hidden_layers=2,
+        fuse_norm=True,
+    ).cuda().half().eval()
+    with torch.no_grad():
+        for parameter in layer.parameters():
+            parameter.uniform_(-0.05, 0.05)
+    hidden = torch.randn(2, 3, 128, device="cuda", dtype=torch.float16).mul_(0.1)
+    first_value = torch.randn_like(hidden).mul_(0.1)
+
+    monkeypatch.setattr(layer_module, "can_use_flash_rwkv_inference", lambda *args, **kwargs: False)
+    with torch.no_grad():
+        expected = layer(hidden.clone(), v_first=first_value.clone())[0]
+
+    calls = []
+    for name in (
+        "infer_tmix_mix6_fp16",
+        "infer_tmix_vres_gate_fp16",
+        "infer_tmix_kk_a_gate_fp16",
+        "infer_tmix_lnx_rkvres_xg_fp16",
+    ):
+        operator = getattr(flash_api, name)
+
+        def observe(*args, _name=name, _operator=operator, **kwargs):
+            calls.append(_name)
+            return _operator(*args, **kwargs)
+
+        monkeypatch.setattr(flash_api, name, observe)
+    monkeypatch.setattr(layer_module, "can_use_flash_rwkv_inference", can_use_flash_rwkv_inference)
+
+    with torch.no_grad():
+        actual = layer(hidden.clone(), v_first=first_value.clone())[0]
+
+    assert calls == [
+        "infer_tmix_mix6_fp16",
+        "infer_tmix_vres_gate_fp16",
+        "infer_tmix_kk_a_gate_fp16",
+        "infer_tmix_lnx_rkvres_xg_fp16",
+    ]
+    assert get_last_rwkv7_provider() == "flash_rwkv"
+    assert get_last_rwkv7_kernel() == "infer_tmix_lnx_rkvres_xg_fp16"
+    torch.testing.assert_close(actual, expected, atol=0.005, rtol=0.02)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_real_provider_standard_feed_forward_inference_matches_unfused_path(monkeypatch):
+    import fla.models.rwkv7.modeling_rwkv7 as model_module
+    from fla.ops.rwkv7.inference import can_use_flash_rwkv_inference
+
+    torch.manual_seed(2612)
+    feed_forward = model_module.RWKV7FeedForward(
+        hidden_size=128,
+        intermediate_size=256,
+        layer_idx=0,
+        num_hidden_layers=1,
+    ).cuda().half().eval()
+    with torch.no_grad():
+        for parameter in feed_forward.parameters():
+            parameter.uniform_(-0.05, 0.05)
+    hidden = torch.randn(2, 3, 128, device="cuda", dtype=torch.float16).mul_(0.1)
+
+    monkeypatch.setattr(model_module, "can_use_flash_rwkv_inference", lambda *args, **kwargs: False)
+    with torch.no_grad():
+        expected = feed_forward(hidden.clone())[0]
+
+    calls = []
+    operator = flash_api.infer_cmix_mix_fp16
+
+    def observe(*args, **kwargs):
+        calls.append("infer_cmix_mix_fp16")
+        return operator(*args, **kwargs)
+
+    monkeypatch.setattr(flash_api, "infer_cmix_mix_fp16", observe)
+    monkeypatch.setattr(model_module, "can_use_flash_rwkv_inference", can_use_flash_rwkv_inference)
+    with torch.no_grad():
+        actual = feed_forward(hidden.clone())[0]
+
+    assert calls == ["infer_cmix_mix_fp16"]
+    assert get_last_rwkv7_provider() == "flash_rwkv"
+    assert get_last_rwkv7_kernel() == "infer_cmix_mix_fp16"
+    torch.testing.assert_close(actual, expected, atol=0.005, rtol=0.02)
