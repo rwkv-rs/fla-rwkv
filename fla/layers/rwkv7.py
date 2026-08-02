@@ -20,8 +20,7 @@ from fla.layers.utils import get_layer_cache, update_layer_cache
 from fla.modules import GroupNorm
 from fla.modules.l2norm import l2_norm
 from fla.modules.token_shift import token_shift
-from fla.ops.rwkv7 import fused_mul_recurrent_rwkv7, recurrent_rwkv7
-from fla.ops.rwkv7.chunk import chunk_rwkv7_reference
+from fla.ops.rwkv7 import chunk_rwkv7, fused_mul_recurrent_rwkv7, recurrent_rwkv7
 from fla.ops.rwkv7.fused_addcmul import fused_addcmul_rwkv7
 from fla.ops.rwkv7.fused_k_update import fused_k_rwkv7
 from fla.ops.rwkv7.gate_output_correction import gate_output_correction
@@ -57,7 +56,7 @@ def _run_rwkv7_operator(
             cu_seqlens=cu_seqlens,
         )
     if mode == 'chunk':
-        return chunk_rwkv7_reference(
+        return chunk_rwkv7(
             r=r,
             w=w,
             k=k,

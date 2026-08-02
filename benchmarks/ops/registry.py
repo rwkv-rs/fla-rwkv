@@ -382,7 +382,7 @@ register_op(OpConfig(
 ))
 
 register_op(OpConfig(
-    name='recurrent_rwkv7',
+    name='chunk_rwkv7',
     import_path='fla.ops.rwkv7',
     inputs={
         'r': TensorSpec(shape_BTHD),
@@ -392,6 +392,7 @@ register_op(OpConfig(
         'a': TensorSpec(shape_BTHD),
         'b': TensorSpec(shape_BTHD),
     },
+    extra_kwargs={'safe_gate': True, 'chunk_size': 64},
     post_init=_rwkv7_post_init,
     category='rwkv',
 ))

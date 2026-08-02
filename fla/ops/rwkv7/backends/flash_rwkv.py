@@ -19,6 +19,7 @@ import re
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
+from threading import Lock
 from types import ModuleType
 from typing import TYPE_CHECKING, Any
 from urllib.parse import unquote, urlparse
@@ -194,11 +195,7 @@ def _validate_public_api(module: ModuleType) -> None:
 
 
 def validate_flash_rwkv_installation() -> FlashRWKVProvenance:
-    """Validate exact distribution, Python module, and native extension ownership.
-
-    Editable installs are intentionally revalidated on every call so a dirty checkout,
-    moved HEAD, or changed origin cannot remain hidden behind a process-wide cache.
-    """
+    """Validate exact distribution, Python module, and native extension ownership."""
 
     try:
         distribution = importlib.metadata.distribution("flash-rwkv")
@@ -290,6 +287,46 @@ def validate_flash_rwkv_installation() -> FlashRWKVProvenance:
     )
 
 
+_FLASH_RWKV_PREFLIGHT_UNSET = object()
+_flash_rwkv_preflight_result: FlashRWKVProvenance | FlashRWKVProvenanceError | object = (
+    _FLASH_RWKV_PREFLIGHT_UNSET
+)
+_flash_rwkv_preflight_lock = Lock()
+
+
+def _resolve_flash_rwkv_preflight(
+    result: FlashRWKVProvenance | FlashRWKVProvenanceError | object,
+) -> FlashRWKVProvenance:
+    if isinstance(result, FlashRWKVProvenanceError):
+        raise result
+    if result is _FLASH_RWKV_PREFLIGHT_UNSET:
+        raise RuntimeError("FlashRWKV preflight result is uninitialized")
+    return result
+
+
+def preflight_flash_rwkv_installation(*, refresh: bool = False) -> FlashRWKVProvenance:
+    """Validate FlashRWKV once per process, or revalidate explicitly.
+
+    The cached admission result keeps recurrent dispatch O(1). Call with
+    ``refresh=True`` after mutating an editable provider checkout.
+    """
+    global _flash_rwkv_preflight_result
+
+    result = _flash_rwkv_preflight_result
+    if not refresh and result is not _FLASH_RWKV_PREFLIGHT_UNSET:
+        return _resolve_flash_rwkv_preflight(result)
+
+    with _flash_rwkv_preflight_lock:
+        result = _flash_rwkv_preflight_result
+        if refresh or result is _FLASH_RWKV_PREFLIGHT_UNSET:
+            try:
+                result = validate_flash_rwkv_installation()
+            except FlashRWKVProvenanceError as error:
+                result = error
+            _flash_rwkv_preflight_result = result
+        return _resolve_flash_rwkv_preflight(result)
+
+
 class FlashRWKVBackend(BaseBackend):
     """Exact FlashRWKV recurrent backend."""
 
@@ -306,7 +343,7 @@ class FlashRWKVBackend(BaseBackend):
     @classmethod
     def is_available(cls) -> bool:
         try:
-            validate_flash_rwkv_installation()
+            preflight_flash_rwkv_installation()
         except FlashRWKVProvenanceError:
             return False
         return True
@@ -513,5 +550,6 @@ __all__ = [
     "FlashRWKVBackend",
     "FlashRWKVProvenance",
     "FlashRWKVProvenanceError",
+    "preflight_flash_rwkv_installation",
     "validate_flash_rwkv_installation",
 ]
