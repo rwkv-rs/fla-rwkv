@@ -5,25 +5,30 @@
 # For a list of all contributors, visit:
 #   https://github.com/fla-org/flash-linear-attention/graphs/contributors
 
+from . import flash_rwkv
 from .backends.flash_rwkv import (
+    FLASH_RWKV_PUBLIC_OPERATORS,
     FLASH_RWKV_SOURCE_REVISION,
     FlashRWKVProvenance,
     FlashRWKVProvenanceError,
     preflight_flash_rwkv_installation,
     validate_flash_rwkv_installation,
 )
-from .backends.provider import get_last_rwkv7_provider
+from .backends.provider import get_last_rwkv7_kernel, get_last_rwkv7_provider
 from .chunk import chunk_rwkv7
 from .fused_recurrent import fused_mul_recurrent_rwkv7, fused_recurrent_rwkv7
 from .recurrent import recurrent_rwkv7
 
 __all__ = [
+    'FLASH_RWKV_PUBLIC_OPERATORS',
     'FLASH_RWKV_SOURCE_REVISION',
     'FlashRWKVProvenance',
     'FlashRWKVProvenanceError',
     'chunk_rwkv7',
+    'flash_rwkv',
     'fused_mul_recurrent_rwkv7',
     'fused_recurrent_rwkv7',
+    'get_last_rwkv7_kernel',
     'get_last_rwkv7_provider',
     'preflight_flash_rwkv_installation',
     'recurrent_rwkv7',

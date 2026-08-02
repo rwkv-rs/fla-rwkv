@@ -21,4 +21,13 @@ def get_last_rwkv7_provider() -> str | None:
     return getattr(_PROVIDER_STATE, "value", None)
 
 
-__all__ = ["get_last_rwkv7_provider"]
+def set_last_rwkv7_kernel(kernel: str | None) -> None:
+    _PROVIDER_STATE.kernel = kernel
+
+
+def get_last_rwkv7_kernel() -> str | None:
+    """Return the exact provider entrypoint used by the last RWKV7 call."""
+    return getattr(_PROVIDER_STATE, "kernel", None)
+
+
+__all__ = ["get_last_rwkv7_kernel", "get_last_rwkv7_provider"]

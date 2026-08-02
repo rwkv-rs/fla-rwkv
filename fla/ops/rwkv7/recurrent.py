@@ -11,7 +11,10 @@ import torch
 
 from fla.ops.backends import dispatch
 from fla.ops.cp import FLACPContext
-from fla.ops.rwkv7.backends.provider import set_last_rwkv7_provider
+from fla.ops.rwkv7.backends.provider import (
+    set_last_rwkv7_kernel,
+    set_last_rwkv7_provider,
+)
 
 
 @dispatch("rwkv7")
@@ -49,6 +52,7 @@ def recurrent_rwkv7(
             "head_first has been removed. Inputs must be in `[B, T, H, ...]` format.",
         )
     set_last_rwkv7_provider(None)
+    set_last_rwkv7_kernel(None)
     raise RuntimeError(
         "public RWKV7 recurrent execution requires the exact FlashRWKV "
         "backend; fallback is disabled"

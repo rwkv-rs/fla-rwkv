@@ -65,7 +65,7 @@ permissions:
   pull-requests: write
 
 env:
-  FLASH_RWKV_SOURCE_REVISION: e81f90108feaafa4d04d552b048ed929a737643e
+  FLASH_RWKV_SOURCE_REVISION: 9fe104c8c748771ba981058a6efcd95c150e453d
 
 concurrency:
   group: rwkv7-flash-adapter-${{ github.event.pull_request.number || inputs.pr_number || github.ref }}

@@ -27,13 +27,43 @@ from urllib.parse import unquote, urlparse
 import torch
 
 from fla.ops.backends import BaseBackend
-from fla.ops.rwkv7.backends.provider import set_last_rwkv7_provider
+from fla.ops.rwkv7.backends.provider import (
+    set_last_rwkv7_kernel,
+    set_last_rwkv7_provider,
+)
 
 if TYPE_CHECKING:
     from fla.ops.cp import FLACPContext
 
-FLASH_RWKV_SOURCE_REVISION = "e81f90108feaafa4d04d552b048ed929a737643e"
+FLASH_RWKV_SOURCE_REVISION = "9fe104c8c748771ba981058a6efcd95c150e453d"
 FLASH_RWKV_REPOSITORY = "https://github.com/rwkv-rs/FlashRWKV.git"
+FLASH_RWKV_PUBLIC_OPERATORS = (
+    "decay_logits_to_log_decay",
+    "infer_chunk_bf16_forward",
+    "infer_chunk_bf16_forward_varlen",
+    "infer_cmix_mix_fp16",
+    "infer_recurrent_fp16_forward_varlen",
+    "infer_recurrent_fp32io16_forward_varlen",
+    "infer_tmix_kk_a_gate_fp16",
+    "infer_tmix_lnx_rkvres_xg_fp16",
+    "infer_tmix_mix6_fp16",
+    "infer_tmix_vres_gate_fp16",
+    "pretrain_cmix_bf16",
+    "pretrain_head_l2wrap_ce_bf16",
+    "pretrain_l2wrap_ce_bf16",
+    "pretrain_recurrent_fp32io16",
+    "pretrain_recurrent_fp32io16_forward",
+    "pretrain_tmix_a_gate_bf16",
+    "pretrain_tmix_kk_pre_bf16",
+    "pretrain_tmix_lnx_rkvres_xg_bf16",
+    "pretrain_tmix_mix6_bf16",
+    "pretrain_tmix_vres_gate_bf16",
+    "rwkv7",
+    "rwkv7_from_decay_logits",
+    "rwkv7_recurrent_stateful",
+    "rwkv7_reference",
+    "statetune_recurrent_fp32io16_forward",
+)
 
 
 class FlashRWKVProvenanceError(RuntimeError):
@@ -125,6 +155,16 @@ def _validate_public_api(module: ModuleType) -> None:
     )
     if version_match is None or tuple(map(int, version_match.groups())) < (0, 1, 0):
         raise FlashRWKVProvenanceError("FlashRWKV version must be at least 0.1.0")
+    missing_operators = tuple(
+        name
+        for name in FLASH_RWKV_PUBLIC_OPERATORS
+        if not callable(getattr(module, name, None))
+    )
+    if missing_operators:
+        raise FlashRWKVProvenanceError(
+            "FlashRWKV public operator suite is incomplete: "
+            f"{', '.join(missing_operators)}"
+        )
     try:
         parameters = inspect.signature(module.rwkv7).parameters
         stateful_parameters = inspect.signature(module.rwkv7_recurrent_stateful).parameters
@@ -484,11 +524,13 @@ class FlashRWKVBackend(BaseBackend):
         import flash_rwkv
 
         set_last_rwkv7_provider(None)
+        set_last_rwkv7_kernel(None)
         requires_grad = any(
             tensor is not None and tensor.requires_grad
             for tensor in (r, w, k, v, a, b, initial_state)
         )
         if state_indices is not None:
+            kernel = "rwkv7_recurrent_stateful"
             output = flash_rwkv.rwkv7_recurrent_stateful(
                 r,
                 w,
@@ -504,6 +546,7 @@ class FlashRWKVBackend(BaseBackend):
             )
             output = (output, initial_state)
         elif requires_grad:
+            kernel = "pretrain_recurrent_fp32io16_forward"
             output = flash_rwkv.pretrain_recurrent_fp32io16_forward(
                 r,
                 w,
@@ -516,6 +559,7 @@ class FlashRWKVBackend(BaseBackend):
                 output_final_state=output_final_state,
             )
         else:
+            kernel = "rwkv7"
             output = flash_rwkv.rwkv7(
                 r,
                 w,
@@ -531,10 +575,12 @@ class FlashRWKVBackend(BaseBackend):
                 algorithm="recurrent",
             )
         set_last_rwkv7_provider("flash_rwkv")
+        set_last_rwkv7_kernel(kernel)
         return output
 
 
 __all__ = [
+    "FLASH_RWKV_PUBLIC_OPERATORS",
     "FLASH_RWKV_REPOSITORY",
     "FLASH_RWKV_SOURCE_REVISION",
     "FlashRWKVBackend",
