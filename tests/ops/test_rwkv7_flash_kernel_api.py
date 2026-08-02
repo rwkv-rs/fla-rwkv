@@ -58,6 +58,10 @@ EXPECTED_PARAMETERS = {
     ),
     "pretrain_tmix_mix6_bf16": ("x", "x_r", "x_w", "x_k", "x_v", "x_a", "x_g"),
     "pretrain_tmix_vres_gate_bf16": ("value", "first_value", "v0", "v12"),
+    "rl_infctx_chunk_fp32io16_factor_recompute": (
+        "r", "log_decay", "k", "v", "a", "b", "scale", "initial_state", "output_final_state", "cu_seqlens",
+        "state_indices", "chunk_size",
+    ),
     "rwkv7": (
         "r", "log_decay", "k", "v", "a", "b", "scale", "initial_state", "output_final_state", "cu_seqlens",
         "state_indices", "mode", "algorithm", "chunk_size", "chunk_config",
