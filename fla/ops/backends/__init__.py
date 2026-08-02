@@ -54,6 +54,7 @@ class BaseBackend:
     package_name: ClassVar[str | None] = None
     env_var: ClassVar[str | None] = None
     default_enable: ClassVar[bool] = True
+    fail_closed_on_explicit_enable: ClassVar[bool] = False
     # Lower number = higher priority, default is 5
     priority: ClassVar[int] = 5
 
@@ -86,6 +87,9 @@ class BaseBackend:
             return verifier(*args, **kwargs)
         except Exception as e:
             return False, str(e)
+
+    def on_explicit_failure(self) -> None:
+        """Clear backend-specific success state before a fail-closed error."""
 
 
 _OPERATION_BACKEND_MODULES: dict[str, str] = {
@@ -182,12 +186,30 @@ def dispatch(operation: str):
             backends_list = registry._get_sorted_backends()
 
             for be in backends_list:
+                explicitly_enabled = (
+                    be.env_var is not None
+                    and be.env_var in os.environ
+                    and os.environ[be.env_var] != "0"
+                )
                 # Avoid be.can_use(): its @cache wrapper breaks torch.compile tracing.
-                if not (be.is_available() and be.is_enabled()):
+                if not be.is_enabled():
+                    continue
+                if not be.is_available():
+                    if be.fail_closed_on_explicit_enable and explicitly_enabled:
+                        be.on_explicit_failure()
+                        raise RuntimeError(
+                            f"explicit backend {be.backend_type!r} is unavailable"
+                        )
                     continue
 
                 can_use, reason = be.verify(func_name, *args, **kwargs)
                 if not can_use:
+                    if be.fail_closed_on_explicit_enable and explicitly_enabled:
+                        be.on_explicit_failure()
+                        raise RuntimeError(
+                            f"explicit backend {be.backend_type!r} rejected "
+                            f"{operation}.{func_name}: {reason}"
+                        )
                     fail_key = f"{operation}:{func_name}:{be.backend_type}:fail"
                     if fail_key not in registry._logged:
                         registry._logged.add(fail_key)
