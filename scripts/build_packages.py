@@ -16,7 +16,7 @@ try:
 except ModuleNotFoundError:
     import tomli as tomllib
 
-BACKEND_EXTRAS = {'cuda', 'rocm', 'xpu', 'npu', 'cpu'}
+CORE_EXTRAS = {'cuda', 'rocm', 'xpu', 'npu', 'cpu', 'flash-rwkv'}
 
 
 def extract_dependencies():
@@ -115,11 +115,10 @@ def build_split_packages(output_dir: str | Path | None = None):
     # extract dependencies
     all_deps, extras = extract_dependencies()
     core_deps, ext_deps = categorize_dependencies(all_deps)
-    core_extras = {k: v for k, v in extras.items() if k in BACKEND_EXTRAS}
-    # extension forwards backend extras to fla-core so flash-linear-attention[cuda]
-    # resolves the same torch/triton flavor as fla-core[cuda].
-    ext_extras = {k: [f'fla-core[{k}]=={version}'] for k in extras if k in BACKEND_EXTRAS}
-    ext_extras.update({k: v for k, v in extras.items() if k not in BACKEND_EXTRAS})
+    core_extras = {k: v for k, v in extras.items() if k in CORE_EXTRAS}
+    # extension forwards core extras to fla-core so public packages resolve dependencies from the package that owns fla.ops.
+    ext_extras = {k: [f'fla-core[{k}]=={version}'] for k in extras if k in CORE_EXTRAS}
+    ext_extras.update({k: v for k, v in extras.items() if k not in CORE_EXTRAS})
 
     # add version constraint for fla-core in extension package
     ext_deps.insert(0, f'fla-core=={version}')
