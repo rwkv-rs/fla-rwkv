@@ -7,10 +7,13 @@
 
 import torch
 
+from fla.ops.backends import dispatch
 from fla.ops.cp import FLACPContext
 from fla.ops.generalized_delta_rule import chunk_dplr_delta_rule
+from fla.ops.rwkv7.backends.provider import set_last_rwkv7_provider
 
 
+@dispatch('rwkv7')
 def chunk_rwkv7(
     r: torch.Tensor,
     w: torch.Tensor,
@@ -73,6 +76,7 @@ def chunk_rwkv7(
         raise DeprecationWarning(
             "head_first has been removed. Inputs must be in `[B, T, H, ...]` format.",
         )
+    set_last_rwkv7_provider('fla')
     return chunk_dplr_delta_rule(
         q=r,
         k=k,
