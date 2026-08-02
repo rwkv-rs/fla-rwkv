@@ -13,7 +13,7 @@ from fla.ops.generalized_delta_rule import chunk_dplr_delta_rule
 from fla.ops.rwkv7.backends.provider import set_last_rwkv7_provider
 
 
-@dispatch('rwkv7')
+@dispatch("rwkv7")
 def chunk_rwkv7(
     r: torch.Tensor,
     w: torch.Tensor,
@@ -72,12 +72,12 @@ def chunk_rwkv7(
             When provided, `initial_state` and `output_final_state` are not supported,
             and `cp_context.cu_seqlens` is used as the local `cu_seqlens`. Default: `None`.
     """
-    if 'head_first' in kwargs:
+    if "head_first" in kwargs:
         raise DeprecationWarning(
             "head_first has been removed. Inputs must be in `[B, T, H, ...]` format.",
         )
-    set_last_rwkv7_provider('fla')
-    return chunk_dplr_delta_rule(
+    set_last_rwkv7_provider(None)
+    result = chunk_dplr_delta_rule(
         q=r,
         k=k,
         v=v,
@@ -94,3 +94,5 @@ def chunk_rwkv7(
         disable_recompute=disable_recompute,
         cp_context=cp_context,
     )
+    set_last_rwkv7_provider("fla")
+    return result
