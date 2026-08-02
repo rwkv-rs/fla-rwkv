@@ -5,6 +5,7 @@ on:
     paths:
       - '.github/workflows/rwkv7-flash-adapter.yml'
       - 'benchmarks/ops/benchmark_rwkv7_flash_provider.py'
+      - 'fla/models/rwkv7/__init__.py'
       - 'fla/ops/rwkv7/**'
       - 'scripts/run_rwkv7_flash_adapter_ci.py'
       - 'tests/ops/test_rwkv7_backends.py'
@@ -13,6 +14,7 @@ on:
     paths:
       - '.github/workflows/rwkv7-flash-adapter.yml'
       - 'benchmarks/ops/benchmark_rwkv7_flash_provider.py'
+      - 'fla/models/rwkv7/__init__.py'
       - 'fla/ops/rwkv7/**'
       - 'scripts/run_rwkv7_flash_adapter_ci.py'
       - 'tests/ops/test_rwkv7_backends.py'
@@ -34,13 +36,16 @@ on:
         required: true
         type: string
       provider_revision:
-        description: 'Full 40-character published FlashRWKV revision to build and benchmark.'
+        description: 'Must equal the fixed published FlashRWKV revision required by this adapter.'
         required: true
         type: string
 
 permissions:
   contents: read
   pull-requests: read
+
+env:
+  FLASH_RWKV_SOURCE_REVISION: 866aafd2eed146b0eda1ce03444009ae030f89e3
 
 concurrency:
   group: rwkv7-flash-adapter-${{ github.event.pull_request.number || inputs.pr_number || github.ref }}
@@ -74,6 +79,7 @@ jobs:
         run: |
           .venv/bin/ruff check \
             benchmarks/ops/benchmark_rwkv7_flash_provider.py \
+            fla/models/rwkv7/__init__.py \
             fla/ops/rwkv7/backends \
             scripts/run_rwkv7_flash_adapter_ci.py \
             tests/ops/test_rwkv7_backends.py
@@ -102,18 +108,24 @@ jobs:
           PR_NUMBER: ${{ inputs.pr_number }}
           SOURCE_REVISION: ${{ inputs.source_revision }}
           PROVIDER_REVISION: ${{ inputs.provider_revision }}
+          PINNED_PROVIDER_REVISION: ${{ env.FLASH_RWKV_SOURCE_REVISION }}
         with:
           script: |
             const revisionPattern = /^[0-9a-f]{40}$/;
             const prNumber = Number(process.env.PR_NUMBER);
             const sourceRevision = process.env.SOURCE_REVISION;
             const providerRevision = process.env.PROVIDER_REVISION;
+            const pinnedProviderRevision = process.env.PINNED_PROVIDER_REVISION;
             if (!Number.isInteger(prNumber) || prNumber <= 0) {
               core.setFailed('pr_number must be a positive integer');
               return;
             }
             if (!revisionPattern.test(sourceRevision) || !revisionPattern.test(providerRevision)) {
               core.setFailed('source_revision and provider_revision must be full lowercase Git revisions');
+              return;
+            }
+            if (providerRevision !== pinnedProviderRevision) {
+              core.setFailed(`provider_revision must equal the fixed FlashRWKV revision ${pinnedProviderRevision}`);
               return;
             }
             const { data: pr } = await github.rest.pulls.get({

@@ -20,6 +20,7 @@ from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 PRO6000_RUNNER_LABEL = "rwkv-sha-pro6000x8"
+FLASH_RWKV_SOURCE_REVISION = "866aafd2eed146b0eda1ce03444009ae030f89e3"
 REVISION_PATTERN = re.compile(r"^[0-9a-f]{40}$")
 
 
@@ -119,6 +120,11 @@ def _validate_benchmark(
 
 def _gpu_gate(args: argparse.Namespace, source_revision: str) -> None:
     _validate_revision("provider revision", args.provider_revision)
+    if args.provider_revision != FLASH_RWKV_SOURCE_REVISION:
+        raise ValueError(
+            "GPU acceptance requires FlashRWKV revision "
+            f"{FLASH_RWKV_SOURCE_REVISION!r}"
+        )
     if args.runner_label != PRO6000_RUNNER_LABEL:
         raise ValueError(f"GPU acceptance requires runner label {PRO6000_RUNNER_LABEL!r}")
 

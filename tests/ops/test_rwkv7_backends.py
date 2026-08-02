@@ -6,14 +6,18 @@
 #   https://github.com/fla-org/flash-linear-attention/graphs/contributors
 
 import importlib
+import os
+import subprocess
 import sys
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 import torch
 
 from fla.ops.rwkv7 import chunk_rwkv7, get_last_rwkv7_provider
-from fla.ops.rwkv7.backends.flash_rwkv import FlashRWKVBackend
+from fla.ops.rwkv7.backends import flash_rwkv as flash_rwkv_backend
+from fla.ops.rwkv7.backends.flash_rwkv import FLASH_RWKV_SOURCE_REVISION, FlashRWKVBackend
 
 
 def _tensor(
@@ -171,6 +175,11 @@ def test_flash_rwkv_availability_checks_version_and_public_api(monkeypatch):
 
     module = SimpleNamespace(__version__="0.1.0", rwkv7=compatible_rwkv7)
     monkeypatch.setattr(importlib, "import_module", lambda name: module)
+    monkeypatch.setattr(
+        flash_rwkv_backend,
+        "_installed_flash_rwkv_revision",
+        lambda: FLASH_RWKV_SOURCE_REVISION,
+    )
     assert FlashRWKVBackend.is_available() is True
 
     module.__version__ = "0.0.9"
@@ -178,6 +187,68 @@ def test_flash_rwkv_availability_checks_version_and_public_api(monkeypatch):
     module.__version__ = "0.1.0"
     module.rwkv7 = lambda: None
     assert FlashRWKVBackend.is_available() is False
+
+
+def test_flash_rwkv_availability_rejects_unpinned_revision(monkeypatch):
+    def compatible_rwkv7(
+        r,
+        log_decay,
+        k,
+        v,
+        a,
+        b,
+        *,
+        scale,
+        initial_state,
+        output_final_state,
+        cu_seqlens,
+        mode,
+        algorithm,
+        chunk_size,
+    ):
+        del r, log_decay, k, v, a, b, scale, initial_state, output_final_state, cu_seqlens, mode, algorithm, chunk_size
+
+    module = SimpleNamespace(__version__="0.1.0", rwkv7=compatible_rwkv7)
+    monkeypatch.setattr(importlib, "import_module", lambda name: module)
+    monkeypatch.setattr(flash_rwkv_backend, "_installed_flash_rwkv_revision", lambda: "0" * 40)
+
+    assert FlashRWKVBackend.is_available() is False
+
+
+def test_pinned_revision_matches_ci_contract():
+    root = Path(__file__).parents[2]
+    script = (root / "scripts/run_rwkv7_flash_adapter_ci.py").read_text(encoding="utf-8")
+    workflow = (root / ".github/workflows/rwkv7-flash-adapter.yml").read_text(encoding="utf-8")
+
+    assert f'FLASH_RWKV_SOURCE_REVISION = "{FLASH_RWKV_SOURCE_REVISION}"' in script
+    assert f"FLASH_RWKV_SOURCE_REVISION: {FLASH_RWKV_SOURCE_REVISION}" in workflow
+
+
+def test_backend_import_preserves_existing_transformers_rwkv7_config():
+    program = """
+from transformers import AutoConfig, PretrainedConfig
+
+try:
+    native_config = type(AutoConfig.for_model("rwkv7"))
+except ValueError:
+    class NativeRWKV7Config(PretrainedConfig):
+        model_type = "rwkv7"
+
+    AutoConfig.register("rwkv7", NativeRWKV7Config)
+    native_config = NativeRWKV7Config
+
+import fla.ops.rwkv7.backends.flash_rwkv
+
+assert type(AutoConfig.for_model("rwkv7")) is native_config
+"""
+    environment = dict(os.environ)
+    environment["CUDA_VISIBLE_DEVICES"] = ""
+    subprocess.run(
+        [sys.executable, "-B", "-c", program],
+        cwd=Path(__file__).parents[2],
+        env=environment,
+        check=True,
+    )
 
 
 def test_chunk_rwkv7_dispatches_to_flash_provider(monkeypatch):
