@@ -18,8 +18,7 @@ from pathlib import Path
 
 import torch
 
-from fla.ops.generalized_delta_rule import chunk_dplr_delta_rule
-from fla.ops.rwkv7 import chunk_rwkv7, get_last_rwkv7_provider
+from fla.ops.rwkv7 import get_last_rwkv7_provider, recurrent_rwkv7
 from fla.ops.rwkv7.backends.flash_rwkv import validate_flash_rwkv_installation
 from fla.utils import device
 
@@ -78,28 +77,58 @@ def _error_summary(actual: torch.Tensor, expected: torch.Tensor) -> dict[str, fl
     }
 
 
-def _run(provider: str, inputs: list[torch.Tensor], state: torch.Tensor):
-    if provider == "flash_rwkv":
-        os.environ.pop("FLA_FLASH_RWKV", None)
-        output, final_state = chunk_rwkv7(
-            *inputs,
-            initial_state=state,
-            output_final_state=True,
-            chunk_size=16,
-        )
-        return output, final_state, get_last_rwkv7_provider()
-    output, final_state = chunk_dplr_delta_rule(
-        q=inputs[0],
-        gk=inputs[1],
-        k=inputs[2],
-        v=inputs[3],
-        a=inputs[4],
-        b=inputs[5],
+def _run_provider(inputs: list[torch.Tensor], state: torch.Tensor):
+    os.environ.pop("FLA_FLASH_RWKV", None)
+    output, final_state = recurrent_rwkv7(
+        *inputs,
         initial_state=state,
         output_final_state=True,
-        chunk_size=16,
     )
-    return output, final_state, "fla-explicit-oracle"
+    return output, final_state, get_last_rwkv7_provider()
+
+
+def _run_oracle(
+    inputs: list[torch.Tensor],
+    state: torch.Tensor,
+    *,
+    scale: float = 1.0,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Evaluate the RWKV7 cell sequentially with ordinary PyTorch ops."""
+    r, log_decay, k, v, a, b = inputs
+    recurrent_state = state.float()
+    outputs = []
+    for token_index in range(r.shape[1]):
+        previous_state = recurrent_state
+        token_a = a[:, token_index].float()
+        a_state = torch.einsum("bhk,bhkv->bhv", token_a, previous_state)
+        recurrent_state = (
+            log_decay[:, token_index].float().exp().unsqueeze(-1) * previous_state
+            + b[:, token_index].float().unsqueeze(-1) * a_state.unsqueeze(-2)
+            + k[:, token_index].float().unsqueeze(-1) * v[:, token_index].float().unsqueeze(-2)
+        )
+        outputs.append(
+            scale
+            * torch.einsum(
+                "bhk,bhkv->bhv",
+                r[:, token_index].float(),
+                recurrent_state,
+            )
+        )
+    return torch.stack(outputs, dim=1).to(v.dtype), recurrent_state
+
+
+def _training_inputs(
+    inputs: list[torch.Tensor],
+    state: torch.Tensor,
+) -> tuple[list[torch.Tensor], torch.Tensor]:
+    return (
+        [tensor.detach().clone().requires_grad_() for tensor in inputs],
+        state.detach().clone().requires_grad_(),
+    )
+
+
+def _backward(output: torch.Tensor, final_state: torch.Tensor) -> None:
+    (output.float().square().mean() + final_state.float().square().mean()).backward()
 
 
 def main() -> None:
@@ -124,19 +153,37 @@ def main() -> None:
     shape = (args.batch_size, args.tokens, args.heads, 64)
     inputs = [(torch.randn(shape, device=device, dtype=dtype) * 0.02).contiguous() for _ in range(6)]
     inputs[1] = torch.full_like(inputs[1], -0.1)
-    state = torch.zeros(args.batch_size, args.heads, 64, 64, device=device, dtype=torch.float32)
+    state = torch.randn(
+        args.batch_size,
+        args.heads,
+        64,
+        64,
+        device=device,
+        dtype=torch.float32,
+    ) * 0.01
 
-    expected, expected_state, baseline_provider = _run("fla", inputs, state)
-    actual, actual_state, selected_provider = _run("flash_rwkv", inputs, state)
+    oracle_inputs, oracle_state = _training_inputs(inputs, state)
+    provider_inputs, provider_state = _training_inputs(inputs, state)
+    expected, expected_state = _run_oracle(oracle_inputs, oracle_state)
+    _backward(expected, expected_state)
+    actual, actual_state, selected_provider = _run_provider(provider_inputs, provider_state)
+    _backward(actual, actual_state)
     torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-3)
     torch.testing.assert_close(actual_state, expected_state, rtol=2e-2, atol=2e-3)
+    for actual_input, expected_input in zip(provider_inputs, oracle_inputs, strict=True):
+        torch.testing.assert_close(actual_input.grad, expected_input.grad, rtol=5e-2, atol=5e-3)
+    torch.testing.assert_close(provider_state.grad, oracle_state.grad, rtol=5e-2, atol=5e-3)
     for _ in range(args.warmup):
-        _run("flash_rwkv", inputs, state)
+        warmup_inputs, warmup_state = _training_inputs(inputs, state)
+        warmup_output, warmup_final_state, _ = _run_provider(warmup_inputs, warmup_state)
+        _backward(warmup_output, warmup_final_state)
     torch.cuda.synchronize()
     samples = []
     for _ in range(args.iters):
+        sample_inputs, sample_state = _training_inputs(inputs, state)
         start = time.perf_counter_ns()
-        _run("flash_rwkv", inputs, state)
+        sample_output, sample_final_state, _ = _run_provider(sample_inputs, sample_state)
+        _backward(sample_output, sample_final_state)
         torch.cuda.synchronize()
         samples.append((time.perf_counter_ns() - start) / 1e6)
     quantiles = torch.tensor(samples).quantile(torch.tensor([0.1, 0.5, 0.9])).tolist()
@@ -150,20 +197,19 @@ def main() -> None:
         )
     report = {
         "schema_version": 1,
-        "label": f"flash-rwkv-{args.dtype}-B{args.batch_size}T{args.tokens}",
+        "label": f"flash-rwkv-recurrent-autograd-{args.dtype}-B{args.batch_size}T{args.tokens}",
         "pr_number": args.pr_number,
         "source_revision": source_revision,
         "backend": selected_provider,
-        "reference_backend": baseline_provider,
         "selected_provider": selected_provider,
-        "baseline_provider": baseline_provider,
+        "oracle": "explicit-pytorch-sequential-recurrent-autograd",
         "flash_rwkv_source": provider_source,
         "flash_rwkv_source_revision": provider_revision,
         "flash_rwkv_native_extension": native_extension_path,
         "hardware": _hardware(args.runner_label),
         "measurement": {
-            "included": "chunk_rwkv7 adapter dispatch, FlashRWKV provider execution, and device synchronization",
-            "excluded": "input allocation, correctness baseline, warmup, provenance collection, and report serialization",
+            "included": "recurrent_rwkv7 dispatch, exact FlashRWKV recurrent forward and backward, and device synchronization",
+            "excluded": "input cloning, correctness oracle, warmup, provenance collection, and report serialization",
         },
         "dtype": args.dtype,
         "head_size": 64,
@@ -180,8 +226,13 @@ def main() -> None:
         "tokens_per_second": args.batch_size * args.tokens / (quantiles[1] / 1000),
         "output_error": _error_summary(actual, expected),
         "final_state_error": _error_summary(actual_state, expected_state),
+        "input_gradient_error": [
+            _error_summary(actual_input.grad, expected_input.grad)
+            for actual_input, expected_input in zip(provider_inputs, oracle_inputs, strict=True)
+        ],
+        "initial_state_gradient_error": _error_summary(provider_state.grad, oracle_state.grad),
     }
-    if selected_provider != "flash_rwkv" or baseline_provider != "fla-explicit-oracle":
+    if selected_provider != "flash_rwkv":
         raise RuntimeError(f"provider selection contract failed: {report}")
     serialized = json.dumps(report, indent=2, sort_keys=True)
     if args.output:

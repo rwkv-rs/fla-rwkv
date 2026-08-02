@@ -5,7 +5,7 @@
 # For a list of all contributors, visit:
 #   https://github.com/fla-org/flash-linear-attention/graphs/contributors
 
-"""Optional FlashRWKV backend for RWKV7 chunk execution."""
+"""Exact FlashRWKV backend for public RWKV7 recurrent execution."""
 
 from __future__ import annotations
 
@@ -113,6 +113,9 @@ def _validate_public_api(module: ModuleType) -> None:
     try:
         parameters = inspect.signature(module.rwkv7).parameters
         stateful_parameters = inspect.signature(module.rwkv7_recurrent_stateful).parameters
+        training_parameters = inspect.signature(
+            module.pretrain_recurrent_fp32io16_forward
+        ).parameters
     except (AttributeError, TypeError, ValueError) as error:
         raise FlashRWKVProvenanceError("FlashRWKV public RWKV7 API is unavailable") from error
     required_parameters = {
@@ -143,11 +146,26 @@ def _validate_public_api(module: ModuleType) -> None:
         "scale",
         "mode",
     }
+    required_training_parameters = {
+        "r",
+        "log_decay",
+        "k",
+        "v",
+        "a",
+        "b",
+        "scale",
+        "initial_state",
+        "output_final_state",
+    }
     if not required_parameters <= parameters.keys():
         raise FlashRWKVProvenanceError("FlashRWKV rwkv7 signature is incompatible")
     if not required_stateful_parameters <= stateful_parameters.keys():
         raise FlashRWKVProvenanceError(
             "FlashRWKV rwkv7_recurrent_stateful signature is incompatible"
+        )
+    if not required_training_parameters <= training_parameters.keys():
+        raise FlashRWKVProvenanceError(
+            "FlashRWKV recurrent autograd signature is incompatible"
         )
     if not callable(getattr(module, "validate_packed_metadata_strict", None)):
         raise FlashRWKVProvenanceError(
@@ -253,7 +271,7 @@ def validate_flash_rwkv_installation() -> FlashRWKVProvenance:
 
 
 class FlashRWKVBackend(BaseBackend):
-    """FlashRWKV FP32-state chunk backend."""
+    """Exact FlashRWKV recurrent backend."""
 
     backend_type = "flash_rwkv"
     package_name = "flash_rwkv"
@@ -273,7 +291,7 @@ class FlashRWKVBackend(BaseBackend):
             return False
         return True
 
-    def chunk_rwkv7_verifier(
+    def recurrent_rwkv7_verifier(
         self,
         r: torch.Tensor,
         w: torch.Tensor,
@@ -325,8 +343,10 @@ class FlashRWKVBackend(BaseBackend):
         )
         if requires_grad and cu_seqlens is not None:
             return False, "FlashRWKV packed execution is forward-only"
+        if requires_grad and mode != "fp32io16":
+            return False, "FlashRWKV recurrent autograd requires mode='fp32io16'"
         if cu_seqlens_cpu is not None:
-            return False, "FlashRWKV does not accept duplicate CPU packed metadata"
+            return False, "FlashRWKV recurrent API does not accept duplicate CPU packed metadata"
         expected_state_rows = r.shape[0]
         if cu_seqlens is not None:
             if r.shape[0] != 1:
@@ -377,18 +397,18 @@ class FlashRWKVBackend(BaseBackend):
                 if initial_state.dtype != expected_state_dtype:
                     return False, f"FlashRWKV stateful {mode} requires a {expected_state_dtype} state pool"
         if cp_context is not None:
-            return False, "FlashRWKV does not support context parallel execution"
+            return False, "FlashRWKV recurrent API does not support context parallel execution"
         if safe_gate:
-            return False, "FlashRWKV does not expose the FLA safe_gate contract"
+            return False, "FlashRWKV recurrent API does not expose the FLA safe_gate contract"
+        if chunk_size is not None:
+            return False, "FlashRWKV recurrent API does not accept chunk_size"
         if disable_recompute:
-            return False, "FlashRWKV does not support disable_recompute=True"
-        if chunk_size not in {None, 16, 32, 64}:
-            return False, f"FlashRWKV chunk_size must be 16, 32, or 64, got {chunk_size}"
+            return False, "FlashRWKV recurrent API does not support disable_recompute=True"
         if kwargs:
             return False, f"FlashRWKV does not support extra arguments: {sorted(kwargs)}"
         return True, None
 
-    def chunk_rwkv7(
+    def recurrent_rwkv7(
         self,
         r: torch.Tensor,
         w: torch.Tensor,
@@ -409,10 +429,14 @@ class FlashRWKVBackend(BaseBackend):
         cp_context: FLACPContext | None = None,
         **kwargs,
     ):
-        del cu_seqlens_cpu, safe_gate, disable_recompute, cp_context, kwargs
+        del cu_seqlens_cpu, safe_gate, chunk_size, disable_recompute, cp_context, kwargs
         import flash_rwkv
 
         set_last_rwkv7_provider(None)
+        requires_grad = any(
+            tensor is not None and tensor.requires_grad
+            for tensor in (r, w, k, v, a, b, initial_state)
+        )
         if state_indices is not None:
             output = flash_rwkv.rwkv7_recurrent_stateful(
                 r,
@@ -428,6 +452,18 @@ class FlashRWKVBackend(BaseBackend):
                 mode=mode,
             )
             output = (output, initial_state)
+        elif requires_grad:
+            output = flash_rwkv.pretrain_recurrent_fp32io16_forward(
+                r,
+                w,
+                k,
+                v,
+                a,
+                b,
+                scale=scale,
+                initial_state=initial_state,
+                output_final_state=output_final_state,
+            )
         else:
             output = flash_rwkv.rwkv7(
                 r,
@@ -441,8 +477,7 @@ class FlashRWKVBackend(BaseBackend):
                 output_final_state=output_final_state,
                 cu_seqlens=cu_seqlens,
                 mode=mode,
-                algorithm="chunk",
-                chunk_size=chunk_size,
+                algorithm="recurrent",
             )
         set_last_rwkv7_provider("flash_rwkv")
         return output

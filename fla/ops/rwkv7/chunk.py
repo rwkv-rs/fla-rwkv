@@ -2,118 +2,50 @@
 #
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
-# For a list of all contributors, visit:
-#   https://github.com/fla-org/flash-linear-attention/graphs/contributors
+
+"""Explicit FLA chunk oracle retained only for tests and comparisons."""
 
 import torch
 
-from fla.ops.backends import dispatch
 from fla.ops.cp import FLACPContext
-from fla.ops.rwkv7.backends.provider import set_last_rwkv7_provider
+from fla.ops.generalized_delta_rule import chunk_dplr_delta_rule
 
 
-@dispatch("rwkv7")
-def chunk_rwkv7(
+def chunk_rwkv7_reference(
     r: torch.Tensor,
     w: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
     a: torch.Tensor,
     b: torch.Tensor,
-    scale: float = 1.0,
+    scale: float | None = None,
     initial_state: torch.Tensor | None = None,
     output_final_state: bool = False,
     cu_seqlens: torch.LongTensor | None = None,
     cu_seqlens_cpu: torch.LongTensor | None = None,
-    state_indices: torch.LongTensor | None = None,
-    mode: str = "fp32io16",
     safe_gate: bool = False,
     chunk_size: int | None = None,
     disable_recompute: bool = False,
     cp_context: FLACPContext | None = None,
-    **kwargs,
 ):
-    """
-    Args:
-        r (torch.Tensor):
-            r of shape `[B, T, H, K]`.
-        w (torch.Tensor):
-            log decay of shape `[B, T, H, K]`.
-        k (torch.Tensor):
-            k of shape `[B, T, H, K]`.
-        v (torch.Tensor):
-            v of shape `[B, T, H, V]`.
-        a (torch.Tensor):
-            a of shape `[B, T, H, K]`.
-        b (torch.Tensor):
-            b of shape `[B, T, H, K]`.
-        scale (float):
-            Scale factor for the attention scores. Default: `1.0`.
-        initial_state (Optional[torch.Tensor]):
-            Initial state of shape `[N, H, K, V]` for `N` input sequences.
-            For equal-length input sequences, `N` equals the batch size `B`.
-            Default: `None`.
-        output_final_state (Optional[bool]):
-            Whether to output the final state of shape `[N, H, K, V]`. Default: `False`.
-        cu_seqlens (torch.LongTensor):
-            Cumulative sequence lengths of shape `[N+1]` used for variable-length training,
-            consistent with the FlashAttention API.
-        cu_seqlens_cpu (torch.LongTensor):
-            CPU copy of `cu_seqlens` to avoid unnecessary device synchronization. Default: `None`.
-        state_indices (torch.LongTensor):
-            Request-owned state-pool rows for packed recurrent inference.
-        mode (str):
-            FlashRWKV numerical mode, either `fp32io16` or `fp16`.
-        safe_gate (Optional[bool]):
-            Whether the kernel can assume the input gate values `g` are in a safe range.
-            When `True`, the kernel can use M=16 TensorCore acceleration.
-            The safe range is approximately `[-5, 0)`. Default: `False`.
-        chunk_size (Optional[int]):
-            Chunk size for the chunked computation. Default: `None`, which means 16.
-        disable_recompute (Optional[bool]):
-            Whether to disable gradient recomputation in the kernel. Default: `False`.
-        cp_context (Optional[FLACPContext]):
-            Context parallel context for distributed training across multiple devices.
-            When provided, `initial_state` and `output_final_state` are not supported,
-            and `cp_context.cu_seqlens` is used as the local `cu_seqlens`. Default: `None`.
-    """
-    if "head_first" in kwargs:
-        raise DeprecationWarning(
-            "head_first has been removed. Inputs must be in `[B, T, H, ...]` format.",
-        )
-    from fla.ops.rwkv7.backends.flash_rwkv import (
-        FLASH_RWKV_SOURCE_REVISION,
-        FlashRWKVBackend,
-    )
-
-    backend = FlashRWKVBackend()
-    set_last_rwkv7_provider(None)
-    if not backend.is_available():
-        raise RuntimeError(
-            "public RWKV7 execution requires the exact FlashRWKV provider at "
-            f"{FLASH_RWKV_SOURCE_REVISION}; reference fallback is disabled"
-        )
-    accepted, reason = backend.chunk_rwkv7_verifier(
-        r,
-        w,
-        k,
-        v,
-        a,
-        b,
+    """Run the upstream FLA chunk implementation as an explicit oracle."""
+    return chunk_dplr_delta_rule(
+        q=r,
+        k=k,
+        v=v,
+        a=a,
+        b=b,
+        gk=w,
         scale=scale,
         initial_state=initial_state,
         output_final_state=output_final_state,
         cu_seqlens=cu_seqlens,
         cu_seqlens_cpu=cu_seqlens_cpu,
-        state_indices=state_indices,
-        mode=mode,
         safe_gate=safe_gate,
         chunk_size=chunk_size,
         disable_recompute=disable_recompute,
         cp_context=cp_context,
-        **kwargs,
     )
-    raise RuntimeError(
-        "exact FlashRWKV provider rejected public RWKV7 execution: "
-        f"{reason if not accepted else 'backend dispatch was bypassed'}"
-    )
+
+
+__all__ = ["chunk_rwkv7_reference"]
