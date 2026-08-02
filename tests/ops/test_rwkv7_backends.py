@@ -25,7 +25,7 @@ from fla.ops.rwkv7.backends.flash_rwkv import (
     FlashRWKVBackend,
     FlashRWKVProvenanceError,
 )
-from scripts.run_rwkv7_flash_adapter_ci import _validate_benchmark
+from scripts.run_rwkv7_flash_adapter_ci import _validate_benchmark, _validate_racecheck
 
 
 def _tensor(
@@ -137,6 +137,29 @@ def test_rwkv7_model_defaults_to_recurrent_product_execution():
 
     assert RWKV7Config().attn_mode == "recurrent"
     assert inspect.signature(RWKV7Attention).parameters["mode"].default == "recurrent"
+
+
+@pytest.mark.parametrize("mode", ["recurrent", "chunk", "fused_recurrent"])
+def test_rwkv7_layer_constructor_preserves_explicit_mode(mode):
+    from fla.layers.rwkv7 import RWKV7Attention
+
+    layer = RWKV7Attention(
+        mode=mode,
+        hidden_size=64,
+        head_dim=64,
+        layer_idx=0,
+        value_dim=64,
+        num_hidden_layers=2,
+    )
+
+    assert layer.mode == mode
+
+
+def test_rwkv7_layer_constructor_rejects_unknown_mode():
+    from fla.layers.rwkv7 import RWKV7Attention
+
+    with pytest.raises(ValueError, match="Not supported mode"):
+        RWKV7Attention(mode="unknown")
 
 
 @pytest.mark.parametrize(
@@ -423,6 +446,8 @@ def test_flash_rwkv_availability_revalidates_public_provenance(monkeypatch):
     [
         "https://github.com/rwkv-rs/FlashRWKV.git",
         "https://github.com/rwkv-rs/flashrwkv",
+        "https://github.com/RWKV-RS/FlashRWKV/",
+        "https://github.com/rwkv-rs/FlashRWKV.git/",
         "git+https://github.com/rwkv-rs/FlashRWKV.git",
         "git@github.com:rwkv-rs/FlashRWKV.git",
         "ssh://git@github.com/rwkv-rs/FlashRWKV.git",
@@ -438,7 +463,17 @@ def test_flash_rwkv_repository_canonicalization_accepts_exact_repo(url):
         "http://github.com/rwkv-rs/FlashRWKV.git",
         "https://example.com/rwkv-rs/FlashRWKV.git",
         "https://github.com/rwkv-rs/FlashRWKV-fork.git",
+        "https://user@github.com/rwkv-rs/FlashRWKV.git",
+        "https://user:secret@github.com/rwkv-rs/FlashRWKV.git",
+        "https://github.com:443/rwkv-rs/FlashRWKV.git",
+        "https://github.com/rwkv-rs/FlashRWKV.git//",
+        "https://github.com//rwkv-rs/FlashRWKV.git",
+        "https://github.com/rwkv-rs%2FFlashRWKV.git",
+        "https://github.com/rwkv-rs/FlashRWKV.git;param",
         "https://github.com/rwkv-rs/FlashRWKV.git?ref=main",
+        "https://github.com/rwkv-rs/FlashRWKV.git#fragment",
+        "https://github.com/rwkv-rſ/FlashRWKV.git",
+        "https://github.com/rwkv-rs/FlashRWKV.git",
     ],
 )
 def test_flash_rwkv_repository_canonicalization_rejects_foreign_source(url):
@@ -446,20 +481,51 @@ def test_flash_rwkv_repository_canonicalization_rejects_foreign_source(url):
 
 
 @pytest.mark.parametrize(
-    ("scenario", "expected"),
+    ("scenario", "expected", "source_url"),
     [
-        ("dirty-editable", "checkout is dirty"),
-        ("wrong-origin", "origin is not"),
-        ("shadow-module", "module is not owned"),
-        ("wrong-native", "_C is not owned"),
-        ("no-direct-url", "lacks PEP 610 direct_url.json"),
-        ("wrong-revision", "PEP 610 commit must be"),
+        ("dirty-editable", "checkout is dirty", None),
+        ("wrong-origin", "origin is not", None),
+        ("shadow-module", "module is not owned", None),
+        ("wrong-native", "_C is not owned", None),
+        ("no-direct-url", "lacks PEP 610 direct_url.json", None),
+        ("wrong-revision", "PEP 610 commit must be", None),
+        (
+            "hostile-repository",
+            "must come from",
+            "https://user:secret@github.com/rwkv-rs/FlashRWKV.git",
+        ),
+        (
+            "hostile-repository",
+            "must come from",
+            "https://github.com:443/rwkv-rs/FlashRWKV.git",
+        ),
+        (
+            "hostile-repository",
+            "must come from",
+            "https://github.com/rwkv-rs/FlashRWKV.git//",
+        ),
+        (
+            "hostile-repository",
+            "must come from",
+            "https://github.com/rwkv-rſ/FlashRWKV.git",
+        ),
+        (
+            "hostile-repository",
+            "must come from",
+            "https://github.com/rwkv-rs/FlashRWKV.git",
+        ),
+        (
+            "hostile-repository",
+            "must come from",
+            "https://github.com/rwkv-rs%2FFlashRWKV.git",
+        ),
     ],
 )
 def test_flash_rwkv_provenance_fresh_process_negatives(
     tmp_path,
     scenario,
     expected,
+    source_url,
 ):
     program = r'''
 import importlib.machinery
@@ -516,7 +582,7 @@ direct_url = (
     {"url": source_root.as_uri(), "dir_info": {"editable": True}}
     if editable
     else {
-        "url": "https://github.com/rwkv-rs/flashrwkv",
+        "url": os.environ.get("CASE_SOURCE_URL") or "https://github.com/rwkv-rs/flashrwkv",
         "vcs_info": {
             "vcs": "git",
             "commit_id": (
@@ -572,6 +638,7 @@ else:
         CASE_ROOT=str(tmp_path),
         CASE_SCENARIO=scenario,
         EXPECTED_ERROR=expected,
+        CASE_SOURCE_URL=source_url or "",
         CUDA_VISIBLE_DEVICES="",
     )
     subprocess.run(
@@ -691,6 +758,7 @@ def test_gpu_gate_validates_complete_result_contract():
         warmup=1,
         iters=3,
     )
+
     del report["tok_s_p50"]
     with pytest.raises(RuntimeError, match="lacks RESULT fields"):
         _validate_benchmark(
@@ -705,6 +773,37 @@ def test_gpu_gate_validates_complete_result_contract():
             warmup=1,
             iters=3,
         )
+
+
+def test_racecheck_parser_requires_canonical_zero_hazard_summary(tmp_path):
+    log = tmp_path / "racecheck.log"
+    operations = (
+        "recurrent_rwkv7_packed_stateful_fp32io16",
+        "recurrent_rwkv7_packed_stateful_fp16",
+    )
+    log.write_text(
+        "\n".join(
+            (
+                *operations,
+                FLASH_RWKV_SOURCE_REVISION,
+                "RACECHECK SUMMARY: 0 hazards displayed (0 errors, 0 warnings)",
+            )
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    evidence = _validate_racecheck(log, FLASH_RWKV_SOURCE_REVISION)
+
+    assert evidence["zero_errors"] is True
+    assert evidence["operations"] == 2
+
+    log.write_text(
+        "\n".join((*operations, FLASH_RWKV_SOURCE_REVISION, "ERROR SUMMARY: 0 errors")) + "\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(RuntimeError, match="zero hazards, errors, and warnings"):
+        _validate_racecheck(log, FLASH_RWKV_SOURCE_REVISION)
 
 
 def test_backend_import_preserves_existing_transformers_rwkv7_config():
