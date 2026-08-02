@@ -15,9 +15,11 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from benchmarks.ops.benchmark_rwkv7_flash_provider import _format_result
 from fla.ops.rwkv7 import chunk_rwkv7, get_last_rwkv7_provider
 from fla.ops.rwkv7.backends import flash_rwkv as flash_rwkv_backend
 from fla.ops.rwkv7.backends.flash_rwkv import FLASH_RWKV_SOURCE_REVISION, FlashRWKVBackend
+from scripts.run_rwkv7_flash_adapter_ci import _validate_benchmark
 
 
 def _tensor(
@@ -222,6 +224,84 @@ def test_pinned_revision_matches_ci_contract():
 
     assert f'FLASH_RWKV_SOURCE_REVISION = "{FLASH_RWKV_SOURCE_REVISION}"' in script
     assert f"FLASH_RWKV_SOURCE_REVISION: {FLASH_RWKV_SOURCE_REVISION}" in workflow
+
+
+def test_benchmark_result_has_complete_stable_fields():
+    row = {
+        "label": "flash-rwkv-float16-B2T4",
+        "B": 2,
+        "T": 4,
+        "iters": 3,
+        "p10_ms": 1.2000000000000002,
+        "p50_ms": 2.0,
+        "p90_ms": 2.8000000000000003,
+        "tok_s_p50": 4000.0,
+    }
+
+    assert _format_result(row) == (
+        "RESULT B=2 T=4 iters=3 p10_ms=1.2 p50_ms=2.0 "
+        "p90_ms=2.8 tok_s_p50=4000.0 label=flash-rwkv-float16-B2T4"
+    )
+    with pytest.raises(ValueError, match="missing RESULT fields"):
+        _format_result({"label": "incomplete"})
+
+
+def test_gpu_gate_validates_complete_result_contract():
+    source_revision = "1" * 40
+    report = {
+        "source_revision": source_revision,
+        "pr_number": 7,
+        "flash_rwkv_source_revision": FLASH_RWKV_SOURCE_REVISION,
+        "backend": "flash_rwkv",
+        "reference_backend": "fla",
+        "selected_provider": "flash_rwkv",
+        "baseline_provider": "fla",
+        "dtype": "float16",
+        "label": "flash-rwkv-float16-B2T4",
+        "B": 2,
+        "T": 4,
+        "warmup": 1,
+        "iters": 3,
+        "p10_ms": 1.2,
+        "p50_ms": 2.0,
+        "p90_ms": 2.8,
+        "tok_s_p50": 4000.0,
+        "latency_ms": {"p10": 1.2, "p50": 2.0, "p90": 2.8},
+        "tokens_per_second": 4000.0,
+        "hardware": {
+            "runner_label": "rwkv-sha-pro6000x8",
+            "device_name": "NVIDIA RTX PRO 6000 Blackwell Workstation Edition",
+        },
+        "output_error": {"max_abs": 0.0, "mean_abs": 0.0, "max_rel": 0.0},
+        "final_state_error": {"max_abs": 0.0, "mean_abs": 0.0, "max_rel": 0.0},
+    }
+
+    _validate_benchmark(
+        report,
+        source_revision=source_revision,
+        provider_revision=FLASH_RWKV_SOURCE_REVISION,
+        runner_label="rwkv-sha-pro6000x8",
+        pr_number=7,
+        dtype="float16",
+        batch_size=2,
+        tokens=4,
+        warmup=1,
+        iters=3,
+    )
+    del report["tok_s_p50"]
+    with pytest.raises(RuntimeError, match="lacks RESULT fields"):
+        _validate_benchmark(
+            report,
+            source_revision=source_revision,
+            provider_revision=FLASH_RWKV_SOURCE_REVISION,
+            runner_label="rwkv-sha-pro6000x8",
+            pr_number=7,
+            dtype="float16",
+            batch_size=2,
+            tokens=4,
+            warmup=1,
+            iters=3,
+        )
 
 
 def test_backend_import_preserves_existing_transformers_rwkv7_config():

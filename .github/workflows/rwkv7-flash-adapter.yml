@@ -42,7 +42,7 @@ on:
 
 permissions:
   contents: read
-  pull-requests: read
+  pull-requests: write
 
 env:
   FLASH_RWKV_SOURCE_REVISION: 866aafd2eed146b0eda1ce03444009ae030f89e3
@@ -199,6 +199,7 @@ jobs:
             --output-dir artifacts/rwkv7-flash-adapter
 
       - name: Upload revision-bound benchmark evidence
+        id: evidence
         if: always()
         uses: actions/upload-artifact@v7.0.1
         with:
@@ -206,3 +207,59 @@ jobs:
           path: artifacts/rwkv7-flash-adapter/*.json
           if-no-files-found: error
           retention-days: 30
+
+      - name: Update pull request benchmark report
+        if: success()
+        uses: actions/github-script@v9.0.0
+        env:
+          ARTIFACT_DIGEST: ${{ steps.evidence.outputs.artifact-digest }}
+          PR_NUMBER: ${{ needs.authorize-gpu.outputs.pr_number }}
+          SOURCE_REVISION: ${{ needs.authorize-gpu.outputs.source_revision }}
+          PROVIDER_REVISION: ${{ needs.authorize-gpu.outputs.provider_revision }}
+        with:
+          script: |
+            const fs = require('fs');
+            const marker = '<!-- fla-rwkv7-flash-adapter-report -->';
+            const manifest = JSON.parse(
+              fs.readFileSync('artifacts/rwkv7-flash-adapter/manifest.json', 'utf8'));
+            const metric = value => String(Math.round(Number(value) * 1e6) / 1e6);
+            const results = manifest.benchmarks.map(row =>
+              `RESULT B=${row.B} T=${row.T} iters=${row.iters} ` +
+              `p10_ms=${metric(row.p10_ms)} p50_ms=${metric(row.p50_ms)} ` +
+              `p90_ms=${metric(row.p90_ms)} tok_s_p50=${metric(row.tok_s_p50)} ` +
+              `label=${row.label} provider=${row.selected_provider} reference=${row.baseline_provider}`
+            );
+            const body = [
+              marker,
+              '### FLA RWKV7 FlashRWKV PRO 6000 report',
+              '',
+              `- FLA head: \`${process.env.SOURCE_REVISION}\``,
+              `- FlashRWKV revision: \`${process.env.PROVIDER_REVISION}\``,
+              `- GPU run: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
+              `- Artifact SHA-256: \`${process.env.ARTIFACT_DIGEST}\``,
+              '- Runner: `rwkv-sha-pro6000x8`, GPU 0',
+              '',
+              '```text',
+              ...results,
+              '```',
+            ].join('\n');
+            const issueNumber = Number(process.env.PR_NUMBER);
+            const { data: comments } = await github.rest.issues.listComments({
+              ...context.repo,
+              issue_number: issueNumber,
+            });
+            const previous = comments.find(comment =>
+              comment.user.type === 'Bot' && comment.body.includes(marker));
+            if (previous) {
+              await github.rest.issues.updateComment({
+                ...context.repo,
+                comment_id: previous.id,
+                body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                ...context.repo,
+                issue_number: issueNumber,
+                body,
+              });
+            }
