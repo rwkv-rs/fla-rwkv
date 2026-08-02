@@ -10,17 +10,17 @@
 from __future__ import annotations
 
 import argparse
-import importlib.metadata
 import json
 import os
 import subprocess
 import time
-from contextlib import suppress
 from pathlib import Path
 
 import torch
 
+from fla.ops.generalized_delta_rule import chunk_dplr_delta_rule
 from fla.ops.rwkv7 import chunk_rwkv7, get_last_rwkv7_provider
+from fla.ops.rwkv7.backends.flash_rwkv import validate_flash_rwkv_installation
 from fla.utils import device
 
 RESULT_FIELDS = ("label", "B", "T", "iters", "p10_ms", "p50_ms", "p90_ms", "tok_s_p50")
@@ -42,21 +42,13 @@ def _format_result(row: dict[str, object]) -> str:
     )
 
 
-def _source_provenance() -> tuple[str, str]:
-    distribution = importlib.metadata.distribution("flash-rwkv")
-    direct_url = distribution.read_text("direct_url.json")
-    metadata = json.loads(direct_url) if direct_url else {}
-    source = metadata.get("url", "unknown")
-    revision = metadata.get("vcs_info", {}).get("commit_id", "unknown")
-    if revision != "unknown":
-        return source, revision
-
-    revision = "unknown"
-    if source.startswith("file://"):
-        path = Path(source.removeprefix("file://"))
-        with suppress(OSError, subprocess.CalledProcessError):
-            revision = subprocess.check_output(["git", "-C", str(path), "rev-parse", "HEAD"], text=True).strip()
-    return source, revision
+def _source_provenance() -> tuple[str, str, str]:
+    provenance = validate_flash_rwkv_installation()
+    return (
+        provenance.repository,
+        provenance.revision,
+        str(provenance.native_extension_path),
+    )
 
 
 def _repository_revision() -> str:
@@ -88,11 +80,26 @@ def _error_summary(actual: torch.Tensor, expected: torch.Tensor) -> dict[str, fl
 
 def _run(provider: str, inputs: list[torch.Tensor], state: torch.Tensor):
     if provider == "flash_rwkv":
-        os.environ["FLA_FLASH_RWKV"] = "1"
-    else:
         os.environ.pop("FLA_FLASH_RWKV", None)
-    output, final_state = chunk_rwkv7(*inputs, initial_state=state, output_final_state=True, chunk_size=16)
-    return output, final_state, get_last_rwkv7_provider()
+        output, final_state = chunk_rwkv7(
+            *inputs,
+            initial_state=state,
+            output_final_state=True,
+            chunk_size=16,
+        )
+        return output, final_state, get_last_rwkv7_provider()
+    output, final_state = chunk_dplr_delta_rule(
+        q=inputs[0],
+        gk=inputs[1],
+        k=inputs[2],
+        v=inputs[3],
+        a=inputs[4],
+        b=inputs[5],
+        initial_state=state,
+        output_final_state=True,
+        chunk_size=16,
+    )
+    return output, final_state, "fla-explicit-oracle"
 
 
 def main() -> None:
@@ -133,7 +140,7 @@ def main() -> None:
         torch.cuda.synchronize()
         samples.append((time.perf_counter_ns() - start) / 1e6)
     quantiles = torch.tensor(samples).quantile(torch.tensor([0.1, 0.5, 0.9])).tolist()
-    provider_source, provider_revision = _source_provenance()
+    provider_source, provider_revision, native_extension_path = _source_provenance()
     source_revision = _repository_revision()
     if args.expected_source_revision and source_revision != args.expected_source_revision:
         raise RuntimeError(f"source revision mismatch: expected={args.expected_source_revision} actual={source_revision}")
@@ -150,9 +157,9 @@ def main() -> None:
         "reference_backend": baseline_provider,
         "selected_provider": selected_provider,
         "baseline_provider": baseline_provider,
-        "flash_rwkv_version": importlib.metadata.version("flash-rwkv"),
         "flash_rwkv_source": provider_source,
         "flash_rwkv_source_revision": provider_revision,
+        "flash_rwkv_native_extension": native_extension_path,
         "hardware": _hardware(args.runner_label),
         "measurement": {
             "included": "chunk_rwkv7 adapter dispatch, FlashRWKV provider execution, and device synchronization",
@@ -174,7 +181,7 @@ def main() -> None:
         "output_error": _error_summary(actual, expected),
         "final_state_error": _error_summary(actual_state, expected_state),
     }
-    if selected_provider != "flash_rwkv" or baseline_provider != "fla":
+    if selected_provider != "flash_rwkv" or baseline_provider != "fla-explicit-oracle":
         raise RuntimeError(f"provider selection contract failed: {report}")
     serialized = json.dumps(report, indent=2, sort_keys=True)
     if args.output:

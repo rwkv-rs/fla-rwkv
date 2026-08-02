@@ -9,7 +9,6 @@ import torch
 
 from fla.ops.backends import dispatch
 from fla.ops.cp import FLACPContext
-from fla.ops.generalized_delta_rule import chunk_dplr_delta_rule
 from fla.ops.rwkv7.backends.provider import set_last_rwkv7_provider
 
 
@@ -82,82 +81,39 @@ def chunk_rwkv7(
         raise DeprecationWarning(
             "head_first has been removed. Inputs must be in `[B, T, H, ...]` format.",
         )
-    if state_indices is not None:
-        from fla.ops.rwkv7.backends.flash_rwkv import FlashRWKVBackend
+    from fla.ops.rwkv7.backends.flash_rwkv import (
+        FLASH_RWKV_SOURCE_REVISION,
+        FlashRWKVBackend,
+    )
 
-        backend = FlashRWKVBackend()
-        set_last_rwkv7_provider(None)
-        if not backend.is_available():
-            raise RuntimeError(
-                "state-indexed RWKV7 execution requires the fixed FlashRWKV provider"
-            )
-        accepted, reason = backend.chunk_rwkv7_verifier(
-            r,
-            w,
-            k,
-            v,
-            a,
-            b,
-            scale=scale,
-            initial_state=initial_state,
-            output_final_state=output_final_state,
-            cu_seqlens=cu_seqlens,
-            cu_seqlens_cpu=cu_seqlens_cpu,
-            state_indices=state_indices,
-            mode=mode,
-            safe_gate=safe_gate,
-            chunk_size=chunk_size,
-            disable_recompute=disable_recompute,
-            cp_context=cp_context,
-            **kwargs,
-        )
-        if not accepted:
-            raise RuntimeError(
-                "state-indexed FlashRWKV execution rejected the call: "
-                f"{reason}"
-            )
-        return backend.chunk_rwkv7(
-            r,
-            w,
-            k,
-            v,
-            a,
-            b,
-            scale=scale,
-            initial_state=initial_state,
-            output_final_state=output_final_state,
-            cu_seqlens=cu_seqlens,
-            cu_seqlens_cpu=cu_seqlens_cpu,
-            state_indices=state_indices,
-            mode=mode,
-            safe_gate=safe_gate,
-            chunk_size=chunk_size,
-            disable_recompute=disable_recompute,
-            cp_context=cp_context,
-            **kwargs,
-        )
-    if mode != "fp32io16":
-        set_last_rwkv7_provider(None)
-        raise RuntimeError(
-            "mode other than 'fp32io16' requires FlashRWKV; fallback is disabled"
-        )
+    backend = FlashRWKVBackend()
     set_last_rwkv7_provider(None)
-    result = chunk_dplr_delta_rule(
-        q=r,
-        k=k,
-        v=v,
-        a=a,
-        b=b,
-        gk=w,
+    if not backend.is_available():
+        raise RuntimeError(
+            "public RWKV7 execution requires the exact FlashRWKV provider at "
+            f"{FLASH_RWKV_SOURCE_REVISION}; reference fallback is disabled"
+        )
+    accepted, reason = backend.chunk_rwkv7_verifier(
+        r,
+        w,
+        k,
+        v,
+        a,
+        b,
         scale=scale,
         initial_state=initial_state,
         output_final_state=output_final_state,
         cu_seqlens=cu_seqlens,
         cu_seqlens_cpu=cu_seqlens_cpu,
+        state_indices=state_indices,
+        mode=mode,
         safe_gate=safe_gate,
         chunk_size=chunk_size,
         disable_recompute=disable_recompute,
         cp_context=cp_context,
+        **kwargs,
     )
-    set_last_rwkv7_provider("fla")
-    return result
+    raise RuntimeError(
+        "exact FlashRWKV provider rejected public RWKV7 execution: "
+        f"{reason if not accepted else 'backend dispatch was bypassed'}"
+    )
