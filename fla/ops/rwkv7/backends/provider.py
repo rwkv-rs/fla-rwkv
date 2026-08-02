@@ -12,13 +12,13 @@ import threading
 _PROVIDER_STATE = threading.local()
 
 
-def set_last_rwkv7_provider(provider: str) -> None:
+def set_last_rwkv7_provider(provider: str | None) -> None:
     _PROVIDER_STATE.value = provider
 
 
 def get_last_rwkv7_provider() -> str | None:
     """Return the provider selected by the last RWKV7 call in this thread."""
-    return getattr(_PROVIDER_STATE, 'value', None)
+    return getattr(_PROVIDER_STATE, "value", None)
 
 
-__all__ = ['get_last_rwkv7_provider']
+__all__ = ["get_last_rwkv7_provider"]
