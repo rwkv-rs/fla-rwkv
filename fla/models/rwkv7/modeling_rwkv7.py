@@ -27,6 +27,8 @@ from fla.modules import FusedCrossEntropyLoss, FusedLinearCrossEntropyLoss, Laye
 from fla.modules.activations import ACT2FN
 from fla.modules.l2warp import l2_warp
 from fla.modules.token_shift import token_shift
+from fla.ops.rwkv7 import flash_rwkv
+from fla.ops.rwkv7.inference import can_use_flash_rwkv_inference
 
 if TYPE_CHECKING:
     from transformers.processing_utils import Unpack
@@ -106,14 +108,41 @@ class RWKV7FeedForward(nn.Module):
     ) -> torch.Tensor:
         if attention_mask is not None:
             x = x.mul(attention_mask[:, -x.shape[-2]:, None])
-        if state is not None:
-            delta, ffn_state = token_shift(x, cu_seqlens, cache=state[self.layer_idx]['ffn_state'], output_cache=True)
+        cached_state = None if state is None else state[self.layer_idx]['ffn_state']
+        flash_shift_state = (
+            torch.zeros(
+                x.shape[0],
+                self.hidden_size,
+                device=x.device,
+                dtype=x.dtype,
+            )
+            if cached_state is None
+            else cached_state
+        )
+        if can_use_flash_rwkv_inference(
+            x,
+            flash_shift_state,
+            self.x_k,
+            cu_seqlens=cu_seqlens,
+        ):
+            mixed = flash_rwkv.infer_cmix_mix_fp16(
+                x,
+                flash_shift_state,
+                self.x_k,
+            )
+            ffn_state = flash_shift_state
         else:
-            delta, ffn_state = token_shift(x, cu_seqlens, output_cache=True)
+            delta, ffn_state = token_shift(
+                x,
+                cu_seqlens,
+                cache=cached_state,
+                output_cache=True,
+            )
+            mixed = x.addcmul(delta, self.x_k)
         if state is not None:
             # no need to update the offset twice
             state.update(ffn_state=ffn_state, layer_idx=self.layer_idx, offset=0)
-        return self.value(self.act_fn(self.key(x.addcmul(delta, self.x_k)))), state
+        return self.value(self.act_fn(self.key(mixed))), state
 
 
 class RWKV7Block(GradientCheckpointingLayer):

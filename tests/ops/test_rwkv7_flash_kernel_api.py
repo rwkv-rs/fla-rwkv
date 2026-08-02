@@ -7,6 +7,7 @@ import inspect
 from types import SimpleNamespace
 
 import pytest
+import torch
 
 import fla.ops
 import fla.ops.rwkv7
@@ -161,3 +162,121 @@ def test_provider_namespace_fails_closed_before_import(monkeypatch):
 
     assert get_last_rwkv7_provider() is None
     assert get_last_rwkv7_kernel() is None
+
+
+def test_standard_attention_inference_routes_all_compatible_fused_blocks(monkeypatch):
+    import fla.layers.rwkv7 as layer_module
+
+    calls = []
+    recurrence = {}
+
+    def mix6(x, shift_state, mixes):
+        calls.append("mix6")
+        shift_state.copy_(x[:, -1])
+        return tuple(x.clone() for _ in mixes)
+
+    def value_residual(value, first_value, gate_bias, gate_delta):
+        del first_value, gate_bias, gate_delta
+        calls.append("value_residual")
+        return value
+
+    def key_gate(key, key_scale, gate_bias, gate_delta, key_gate_scale):
+        del key_scale, gate_bias, gate_delta, key_gate_scale
+        calls.append("key_gate")
+        return key, -torch.ones_like(key), torch.full_like(key, 0.25)
+
+    def output_transform(output, receptance, key, value, residual_scale, norm_weight, norm_bias, gate):
+        del receptance, key, value, residual_scale, norm_weight, norm_bias, gate
+        calls.append("output_transform")
+        return output
+
+    def recurrence_call(mode, **kwargs):
+        recurrence.update(mode=mode, **kwargs)
+        return torch.zeros_like(kwargs["r"]), None
+
+    monkeypatch.setattr(layer_module, "can_use_flash_rwkv_inference", lambda *args, **kwargs: True)
+    monkeypatch.setattr(layer_module.flash_rwkv, "infer_tmix_mix6_fp16", mix6)
+    monkeypatch.setattr(layer_module.flash_rwkv, "infer_tmix_vres_gate_fp16", value_residual)
+    monkeypatch.setattr(layer_module.flash_rwkv, "infer_tmix_kk_a_gate_fp16", key_gate)
+    monkeypatch.setattr(layer_module.flash_rwkv, "infer_tmix_lnx_rkvres_xg_fp16", output_transform)
+    monkeypatch.setattr(layer_module, "_run_rwkv7_operator", recurrence_call)
+
+    layer = layer_module.RWKV7Attention(
+        hidden_size=64,
+        head_dim=64,
+        layer_idx=1,
+        value_dim=64,
+        num_hidden_layers=2,
+        fuse_norm=True,
+    )
+    hidden = torch.randn(1, 2, 64)
+    first_value = torch.randn_like(hidden)
+    with torch.no_grad():
+        layer(hidden, v_first=first_value)
+
+    assert calls == ["mix6", "value_residual", "key_gate", "output_transform"]
+    assert recurrence["mode"] == "recurrent"
+    assert recurrence["kk"] is None
+    assert recurrence["a"] is None
+    assert torch.equal(recurrence["flash_a"], -torch.ones_like(recurrence["flash_a"]))
+    assert torch.equal(recurrence["flash_b"], torch.full_like(recurrence["flash_b"], 0.25))
+
+
+def test_standard_feed_forward_inference_routes_flash_cmix(monkeypatch):
+    import fla.models.rwkv7.modeling_rwkv7 as model_module
+
+    calls = []
+
+    def cmix(x, shift_state, mix):
+        calls.append((x, shift_state, mix))
+        shift_state.copy_(x[:, -1])
+        return x
+
+    monkeypatch.setattr(model_module, "can_use_flash_rwkv_inference", lambda *args, **kwargs: True)
+    monkeypatch.setattr(model_module.flash_rwkv, "infer_cmix_mix_fp16", cmix)
+    feed_forward = model_module.RWKV7FeedForward(
+        hidden_size=64,
+        intermediate_size=256,
+        layer_idx=0,
+        num_hidden_layers=1,
+    )
+    hidden = torch.randn(1, 2, 64)
+    with torch.no_grad():
+        output, state = feed_forward(hidden)
+
+    assert output.shape == hidden.shape
+    assert state is None
+    assert len(calls) == 1
+    assert calls[0][0] is hidden
+    assert torch.equal(calls[0][1], hidden[:, -1])
+    assert calls[0][2] is feed_forward.x_k
+
+
+def test_flash_inference_eligibility_excludes_packed_and_training_paths(monkeypatch):
+    from fla.ops.rwkv7.inference import can_use_flash_rwkv_inference
+
+    class EligibleTensor(torch.Tensor):
+        @property
+        def is_cuda(self):
+            return True
+
+        @property
+        def device(self):
+            return torch.device("cuda")
+
+        def is_contiguous(self):
+            return True
+
+    tensor = torch.Tensor._make_subclass(
+        EligibleTensor,
+        torch.empty(1, dtype=torch.float16),
+        False,
+    )
+    monkeypatch.setattr(torch, "is_grad_enabled", lambda: False)
+
+    assert can_use_flash_rwkv_inference(tensor, head_dim=64)
+    assert not can_use_flash_rwkv_inference(tensor, head_dim=32)
+    assert not can_use_flash_rwkv_inference(tensor, cu_seqlens=object())
+
+    monkeypatch.setattr(torch, "is_grad_enabled", lambda: True)
+    assert not can_use_flash_rwkv_inference(tensor, head_dim=64)

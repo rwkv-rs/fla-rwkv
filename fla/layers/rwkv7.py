@@ -20,10 +20,11 @@ from fla.layers.utils import get_layer_cache, update_layer_cache
 from fla.modules import GroupNorm
 from fla.modules.l2norm import l2_norm
 from fla.modules.token_shift import token_shift
-from fla.ops.rwkv7 import chunk_rwkv7, fused_mul_recurrent_rwkv7, recurrent_rwkv7
+from fla.ops.rwkv7 import chunk_rwkv7, flash_rwkv, fused_mul_recurrent_rwkv7, recurrent_rwkv7
 from fla.ops.rwkv7.fused_addcmul import fused_addcmul_rwkv7
 from fla.ops.rwkv7.fused_k_update import fused_k_rwkv7
 from fla.ops.rwkv7.gate_output_correction import gate_output_correction
+from fla.ops.rwkv7.inference import can_use_flash_rwkv_inference
 
 if TYPE_CHECKING:
     from fla.models.utils import Cache
@@ -36,26 +37,40 @@ def _run_rwkv7_operator(
     w: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
-    kk: torch.Tensor,
-    a: torch.Tensor,
+    kk: torch.Tensor | None,
+    a: torch.Tensor | None,
     recurrent_state: torch.Tensor | None,
     output_final_state: bool,
     cu_seqlens: torch.LongTensor | None,
+    flash_a: torch.Tensor | None = None,
+    flash_b: torch.Tensor | None = None,
 ):
     if mode == 'recurrent':
+        if (flash_a is None) != (flash_b is None):
+            raise ValueError("FlashRWKV recurrence operands must be supplied together")
+        if flash_a is None:
+            if kk is None or a is None:
+                raise ValueError("recurrent mode requires either FLA or FlashRWKV operands")
+            recurrence_a = -kk
+            recurrence_b = kk * a
+        else:
+            recurrence_a = flash_a
+            recurrence_b = flash_b
         return recurrent_rwkv7(
             r=r,
             w=w,
             k=k,
             v=v,
-            a=-kk,
-            b=kk * a,
+            a=recurrence_a,
+            b=recurrence_b,
             scale=1.,
             initial_state=recurrent_state,
             output_final_state=output_final_state,
             cu_seqlens=cu_seqlens,
         )
     if mode == 'chunk':
+        if kk is None or a is None:
+            raise ValueError("chunk mode requires explicit normalized key and gate tensors")
         return chunk_rwkv7(
             r=r,
             w=w,
@@ -71,6 +86,8 @@ def _run_rwkv7_operator(
             chunk_size=64,
         )
     if mode == 'fused_recurrent':
+        if kk is None or a is None:
+            raise ValueError("fused_recurrent mode requires explicit normalized key and gate tensors")
         return fused_mul_recurrent_rwkv7(
             r=r,
             w=w,
@@ -84,6 +101,17 @@ def _run_rwkv7_operator(
             cu_seqlens=cu_seqlens,
         )
     raise ValueError(f"Not supported mode `{mode}`.")
+
+
+def _lora_delta_and_bias(
+    module: LoRA,
+    x: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    hidden = module.lora[1](module.lora[0](x))
+    projection = module.lora[2]
+    if projection.bias is None:
+        raise RuntimeError("FlashRWKV fused gates require an explicit LoRA bias")
+    return F.linear(hidden, projection.weight), projection.bias
 
 
 class RWKV7Attention(nn.Module):
@@ -154,6 +182,7 @@ class RWKV7Attention(nn.Module):
         self.layer_idx = layer_idx
         self.num_hidden_layers = num_hidden_layers
         self.fuse_norm = fuse_norm
+        self.norm_eps = norm_eps
 
         self.time_shift = nn.ZeroPad2d((0, 0, 1, -1))
         self.x_r = nn.Parameter(torch.zeros(1, 1, hidden_size))
@@ -311,11 +340,46 @@ class RWKV7Attention(nn.Module):
             conv_cache = last_state['conv_state']
             recurrent_state = last_state['recurrent_state']
 
-        delta, conv_state = token_shift(
-            hidden_states, cu_seqlens, output_cache=True, cache=conv_cache,
+        mixes = tuple(
+            parameter.reshape(-1)
+            for parameter in (self.x_r, self.x_w, self.x_k, self.x_v, self.x_a, self.x_g)
         )
-        xr, xw, xk, xv, xa, xg = fused_addcmul_rwkv7(hidden_states, delta, self.x_r, self.x_w,
-                                                     self.x_k, self.x_v, self.x_a, self.x_g)
+        flash_shift_state = (
+            torch.zeros(
+                batch_size,
+                self.hidden_size,
+                device=hidden_states.device,
+                dtype=hidden_states.dtype,
+            )
+            if conv_cache is None
+            else conv_cache
+        )
+        if can_use_flash_rwkv_inference(
+            hidden_states,
+            flash_shift_state,
+            *mixes,
+            cu_seqlens=cu_seqlens,
+        ):
+            xr, xw, xk, xv, xa, xg = flash_rwkv.infer_tmix_mix6_fp16(
+                hidden_states,
+                flash_shift_state,
+                mixes,
+            )
+            conv_state = flash_shift_state
+        else:
+            delta, conv_state = token_shift(
+                hidden_states, cu_seqlens, output_cache=True, cache=conv_cache,
+            )
+            xr, xw, xk, xv, xa, xg = fused_addcmul_rwkv7(
+                hidden_states,
+                delta,
+                self.x_r,
+                self.x_w,
+                self.x_k,
+                self.x_v,
+                self.x_a,
+                self.x_g,
+            )
 
         r = self.r_proj(xr)
         # Using bf16 for LoRA computation is numerically safe here because:
@@ -334,30 +398,69 @@ class RWKV7Attention(nn.Module):
         if self.layer_idx == 0:
             v_first = v
         else:
-            v = torch.lerp(v, v_first, self.v_lora(xv).sigmoid())
-        a = self.a_lora(xa).sigmoid()
+            v_delta, v_bias = _lora_delta_and_bias(self.v_lora, xv)
+            if can_use_flash_rwkv_inference(
+                v,
+                v_first,
+                v_bias,
+                v_delta,
+                cu_seqlens=cu_seqlens,
+            ):
+                v = flash_rwkv.infer_tmix_vres_gate_fp16(
+                    v,
+                    v_first,
+                    v_bias,
+                    v_delta,
+                )
+            else:
+                v = torch.lerp(v, v_first, torch.sigmoid(v_bias + v_delta))
         g = self.g_lora(xg)
 
-        if self.fuse_norm:
-            kk = l2_norm(rearrange(k * self.k_k, 'b t (h d) -> b t h d', d=self.head_dim))
+        a_delta, a_bias = _lora_delta_and_bias(self.a_lora, xa)
+        if self.mode == 'recurrent' and can_use_flash_rwkv_inference(
+            k,
+            self.k_k,
+            a_bias,
+            a_delta,
+            self.k_a,
+            cu_seqlens=cu_seqlens,
+            head_dim=self.head_dim,
+        ):
+            k, flash_a, flash_b = flash_rwkv.infer_tmix_kk_a_gate_fp16(
+                k,
+                self.k_k,
+                a_bias,
+                a_delta,
+                self.k_a,
+            )
+            kk = None
+            a = None
         else:
-            kk = F.normalize(rearrange(k * self.k_k, 'b t (h d) -> b t h d', d=self.head_dim), dim=-1, p=2.0)
+            a = torch.sigmoid(a_bias + a_delta)
+            if self.fuse_norm:
+                kk = l2_norm(rearrange(k * self.k_k, 'b t (h d) -> b t h d', d=self.head_dim))
+            else:
+                kk = F.normalize(
+                    rearrange(k * self.k_k, 'b t (h d) -> b t h d', d=self.head_dim),
+                    dim=-1,
+                    p=2.0,
+                )
 
-        # Prefer addcmul over expanded form for numerical stability in bf16:
-        # 1. Fused Multiply-Add (FMA) in addcmul reduces intermediate rounding:
-        #    - Single op vs original 3 ops (mul, sub, mul)
-        #    - 1 less intermediate value storage (bf16 write->read overhead)
-        # 2. Mathematically equivalent to k*(1 + (a-1)*self.k_a)
-        #    but with better precision preservation
-        # 3. Particularly crucial for bf16 where intermediate values easily lose precision
-        # 4. Pytorch method: k = k.addcmul(k * (a - 1), self.k_a)
-        k = fused_k_rwkv7(k, a, self.k_a)
+            # Preserve the BF16-stable fused multiply-add path outside eligible FP16 inference.
+            k = fused_k_rwkv7(k, a, self.k_a)
+            flash_a = None
+            flash_b = None
 
         # dealing with left-padding
         if attention_mask is not None:
             v = v * am
 
-        r, w, k, a = map(lambda x: rearrange(x, 'b t (h d) -> b t h d', d=self.head_dim), (r, w, k, a))
+        r, w, k = map(lambda x: rearrange(x, 'b t (h d) -> b t h d', d=self.head_dim), (r, w, k))
+        if a is not None:
+            a = rearrange(a, 'b t (h d) -> b t h d', d=self.head_dim)
+        if flash_a is not None:
+            flash_a = rearrange(flash_a, 'b t (h d) -> b t h d', d=self.head_dim)
+            flash_b = rearrange(flash_b, 'b t (h d) -> b t h d', d=self.head_dim)
         v = rearrange(v, 'b t (h d) -> b t h d', d=self.head_v_dim)
 
         o, recurrent_state = _run_rwkv7_operator(
@@ -368,6 +471,8 @@ class RWKV7Attention(nn.Module):
             v=v,
             kk=kk,
             a=a,
+            flash_a=flash_a,
+            flash_b=flash_b,
             recurrent_state=recurrent_state,
             output_final_state=use_cache,
             cu_seqlens=cu_seqlens,
@@ -381,12 +486,48 @@ class RWKV7Attention(nn.Module):
             offset=r.shape[1],
         )
 
-        if self.fuse_norm:
-            o = self.g_norm(rearrange(o, '... h d -> ... (h d)'))
+        flat_o = rearrange(o, 'b t h d -> b t (h d)')
+        flat_r = rearrange(r, 'b t h d -> b t (h d)')
+        flat_k = rearrange(k, 'b t h d -> b t (h d)')
+        flat_v = rearrange(v, 'b t h d -> b t (h d)')
+        residual_scale = self.r_k.reshape(-1)
+        norm_weight = self.g_norm.weight
+        norm_bias = self.g_norm.bias
+        if (
+            self.mode == 'recurrent'
+            and self.key_dim == self.value_dim
+            and norm_weight is not None
+            and norm_bias is not None
+            and self.g_norm.eps == 64e-5
+            and can_use_flash_rwkv_inference(
+                flat_o,
+                flat_r,
+                flat_k,
+                flat_v,
+                residual_scale,
+                norm_weight,
+                norm_bias,
+                g,
+                cu_seqlens=cu_seqlens,
+                head_dim=self.head_dim,
+            )
+        ):
+            o = flash_rwkv.infer_tmix_lnx_rkvres_xg_fp16(
+                flat_o,
+                flat_r,
+                flat_k,
+                flat_v,
+                residual_scale,
+                norm_weight,
+                norm_bias,
+                g,
+            )
         else:
-            o = self.g_norm(rearrange(o, 'b t h d -> (b t) (h d)')).view(batch_size, seq_len, -1)
-
-        o = gate_output_correction(o, r, k, self.r_k, v, g)
+            if self.fuse_norm:
+                o = self.g_norm(flat_o)
+            else:
+                o = self.g_norm(flat_o.view(batch_size * seq_len, -1)).view(batch_size, seq_len, -1)
+            o = gate_output_correction(o, r, k, self.r_k, v, g)
         o = self.o_proj(o)
 
         return o, None, past_key_values, v_first
