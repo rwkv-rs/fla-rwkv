@@ -584,6 +584,40 @@ def test_benchmark_result_has_complete_stable_fields():
         _format_result({"label": "incomplete"})
 
 
+def test_packed_benchmark_help_does_not_import_optional_provider(tmp_path):
+    root = Path(__file__).parents[2]
+    (tmp_path / "flash_rwkv.py").write_text(
+        'raise RuntimeError("optional provider imported during CLI discovery")\n',
+        encoding="utf-8",
+    )
+    (tmp_path / "sitecustomize.py").write_text(
+        "import importlib.metadata as metadata\n"
+        "original_distribution = metadata.distribution\n"
+        "def distribution(name):\n"
+        "    if name == 'flash-rwkv':\n"
+        "        raise metadata.PackageNotFoundError(name)\n"
+        "    return original_distribution(name)\n"
+        "metadata.distribution = distribution\n",
+        encoding="utf-8",
+    )
+    environment = dict(os.environ)
+    environment["CUDA_VISIBLE_DEVICES"] = ""
+    environment["PYTHONPATH"] = os.pathsep.join((str(tmp_path), str(root)))
+
+    subprocess.run(
+        [
+            sys.executable,
+            str(root / "benchmarks/ops/benchmark_rwkv7_flash_packed_provider.py"),
+            "--help",
+        ],
+        cwd=root,
+        env=environment,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+
 def test_gpu_gate_validates_complete_result_contract():
     source_revision = "1" * 40
     report = {

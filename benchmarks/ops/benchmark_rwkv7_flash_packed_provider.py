@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import argparse
+import importlib
 import json
 import os
 import platform
@@ -17,8 +18,8 @@ import time
 from dataclasses import dataclass
 from functools import wraps
 from pathlib import Path
+from types import ModuleType
 
-import flash_rwkv
 import torch
 
 from fla.ops.rwkv7 import get_last_rwkv7_provider, recurrent_rwkv7
@@ -271,6 +272,7 @@ def _cuda_graph_evidence(
 def _run_case(
     profile: str,
     *,
+    provider_module: ModuleType,
     mode: str,
     hidden_size: int,
     warmup: int,
@@ -284,7 +286,7 @@ def _run_case(
         mode=mode,
         seed=seed,
     )
-    flash_rwkv.validate_packed_metadata_strict(
+    provider_module.validate_packed_metadata_strict(
         payload.cu_seqlens,
         payload.state_indices,
         total_tokens=payload.total_tokens,
@@ -458,6 +460,7 @@ def main() -> None:
         parser.error("hidden-size must be a positive multiple of 64")
     if args.warmup <= 0 or args.iters <= 0:
         parser.error("warmup and iters must be positive")
+    provider_module = importlib.import_module("flash_rwkv")
     source_revision = _repository_revision()
     if source_revision != args.expected_source_revision:
         raise RuntimeError(
@@ -470,7 +473,7 @@ def main() -> None:
         )
 
     observed: dict[str, torch.Tensor] = {}
-    original = flash_rwkv.rwkv7_recurrent_stateful
+    original = provider_module.rwkv7_recurrent_stateful
 
     @wraps(original)
     def observe_metadata(*call_args, **call_kwargs):
@@ -479,11 +482,12 @@ def main() -> None:
         observed["state_indices"] = call_kwargs["state_indices"]
         return original(*call_args, **call_kwargs)
 
-    flash_rwkv.rwkv7_recurrent_stateful = observe_metadata
+    provider_module.rwkv7_recurrent_stateful = observe_metadata
     try:
         results = [
             _run_case(
                 profile,
+                provider_module=provider_module,
                 mode=args.mode,
                 hidden_size=args.hidden_size,
                 warmup=args.warmup,
@@ -494,7 +498,7 @@ def main() -> None:
             for index, profile in enumerate(args.profiles)
         ]
     finally:
-        flash_rwkv.rwkv7_recurrent_stateful = original
+        provider_module.rwkv7_recurrent_stateful = original
     payload = {
         "schema_version": 1,
         "benchmark": "fla_rwkv7_flash_packed_serving",
