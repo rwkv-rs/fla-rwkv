@@ -19,7 +19,7 @@ class RWKV7Config(_HybridAttentionConfigMixin, PretrainedConfig):
 
     def __init__(
         self,
-        attn_mode: str = "chunk",
+        attn_mode: str = "recurrent",
         hidden_size: int = 2048,
         hidden_ratio: int | None = 4,
         intermediate_size: int | None = None,

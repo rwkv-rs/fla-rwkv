@@ -5,24 +5,38 @@ on:
     paths:
       - '.github/workflows/rwkv7-flash-adapter.yml'
       - 'benchmarks/ops/benchmark_rwkv7_flash_provider.py'
-      - 'fla/models/rwkv7/__init__.py'
+      - 'benchmarks/ops/benchmark_rwkv7_flash_packed_provider.py'
+      - 'benchmarks/ops/registry.py'
+      - 'fla/layers/rwkv7.py'
+      - 'fla/models/rwkv7/**'
+      - 'fla/ops/__init__.py'
       - 'fla/ops/rwkv7/**'
       - 'pyproject.toml'
       - 'scripts/build_packages.py'
       - 'scripts/run_rwkv7_flash_adapter_ci.py'
       - 'tests/ops/test_rwkv7_backends.py'
+      - 'tests/ops/test_rwkv7.py'
+      - 'tests/context_parallel/test_cp_rwkv7.py'
+      - 'tests/racecheck/test_rwkv7_flash_adapter.py'
       - 'tests/test_rwkv7_flash_packaging.py'
   push:
     branches: [main]
     paths:
       - '.github/workflows/rwkv7-flash-adapter.yml'
       - 'benchmarks/ops/benchmark_rwkv7_flash_provider.py'
-      - 'fla/models/rwkv7/__init__.py'
+      - 'benchmarks/ops/benchmark_rwkv7_flash_packed_provider.py'
+      - 'benchmarks/ops/registry.py'
+      - 'fla/layers/rwkv7.py'
+      - 'fla/models/rwkv7/**'
+      - 'fla/ops/__init__.py'
       - 'fla/ops/rwkv7/**'
       - 'pyproject.toml'
       - 'scripts/build_packages.py'
       - 'scripts/run_rwkv7_flash_adapter_ci.py'
       - 'tests/ops/test_rwkv7_backends.py'
+      - 'tests/ops/test_rwkv7.py'
+      - 'tests/context_parallel/test_cp_rwkv7.py'
+      - 'tests/racecheck/test_rwkv7_flash_adapter.py'
       - 'tests/test_rwkv7_flash_packaging.py'
   workflow_dispatch:
     inputs:
@@ -85,11 +99,21 @@ jobs:
         run: |
           .venv/bin/ruff check \
             benchmarks/ops/benchmark_rwkv7_flash_provider.py \
-            fla/models/rwkv7/__init__.py \
+            benchmarks/ops/benchmark_rwkv7_flash_packed_provider.py \
+            benchmarks/ops/registry.py \
+            fla/layers/rwkv7.py \
+            fla/models/rwkv7 \
+            fla/ops/__init__.py \
+            fla/ops/rwkv7/__init__.py \
             fla/ops/rwkv7/backends \
+            fla/ops/rwkv7/chunk.py \
+            fla/ops/rwkv7/recurrent.py \
             scripts/build_packages.py \
             scripts/run_rwkv7_flash_adapter_ci.py \
             tests/ops/test_rwkv7_backends.py \
+            tests/ops/test_rwkv7.py \
+            tests/context_parallel/test_cp_rwkv7.py \
+            tests/racecheck/test_rwkv7_flash_adapter.py \
             tests/test_rwkv7_flash_packaging.py
 
       - name: Run CPU adapter gate
@@ -199,11 +223,24 @@ jobs:
           PROVIDER_REVISION: ${{ needs.authorize-gpu.outputs.provider_revision }}
           PR_NUMBER: ${{ needs.authorize-gpu.outputs.pr_number }}
         run: |
+          mkdir -p artifacts/rwkv7-flash-adapter
+          command -v compute-sanitizer
+          compute-sanitizer --version
+          set -o pipefail
+          compute-sanitizer \
+            --tool racecheck \
+            --racecheck-report hazard \
+            --error-exitcode 99 \
+            --launch-timeout 0 \
+            --print-limit 100 \
+            .venv/bin/python tests/racecheck/test_rwkv7_flash_adapter.py \
+            2>&1 | tee artifacts/rwkv7-flash-adapter/racecheck.log
           .venv/bin/python scripts/run_rwkv7_flash_adapter_ci.py gpu \
             --source-revision "$SOURCE_REVISION" \
             --provider-revision "$PROVIDER_REVISION" \
             --runner-label "$RWKV7_BENCH_RUNNER_LABEL" \
             --pr-number "$PR_NUMBER" \
+            --racecheck-log artifacts/rwkv7-flash-adapter/racecheck.log \
             --output-dir artifacts/rwkv7-flash-adapter
 
       - name: Upload revision-bound benchmark evidence
@@ -212,7 +249,7 @@ jobs:
         uses: actions/upload-artifact@v7.0.1
         with:
           name: ${{ needs.authorize-gpu.outputs.artifact_name }}
-          path: artifacts/rwkv7-flash-adapter/*.json
+          path: artifacts/rwkv7-flash-adapter/**
           if-no-files-found: error
           retention-days: 30
 
@@ -231,11 +268,15 @@ jobs:
             const manifest = JSON.parse(
               fs.readFileSync('artifacts/rwkv7-flash-adapter/manifest.json', 'utf8'));
             const metric = value => String(Math.round(Number(value) * 1e6) / 1e6);
-            const results = manifest.benchmarks.map(row =>
+            const rows = [
+              ...manifest.benchmarks,
+              ...manifest.packed_benchmarks.flatMap(report => report.results),
+            ];
+            const results = rows.map(row =>
               `RESULT B=${row.B} T=${row.T} iters=${row.iters} ` +
               `p10_ms=${metric(row.p10_ms)} p50_ms=${metric(row.p50_ms)} ` +
               `p90_ms=${metric(row.p90_ms)} tok_s_p50=${metric(row.tok_s_p50)} ` +
-              `label=${row.label} provider=${row.selected_provider} reference=${row.baseline_provider}`
+              `label=${row.label} provider=${row.selected_provider || row.provider} oracle=${row.oracle}`
             );
             const body = [
               marker,
@@ -243,9 +284,13 @@ jobs:
               '',
               `- FLA head: \`${process.env.SOURCE_REVISION}\``,
               `- FlashRWKV revision: \`${process.env.PROVIDER_REVISION}\``,
+              `- FlashRWKV clean evidence: \`${manifest.flash_rwkv_clean_evidence.evidence_revision}\`, ` +
+                `run \`${manifest.flash_rwkv_clean_evidence.workflow_run_id}\`, ` +
+                `artifact \`${manifest.flash_rwkv_clean_evidence.artifact_id}\``,
               `- GPU run: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
               `- Artifact SHA-256: \`${process.env.ARTIFACT_DIGEST}\``,
               '- Runner: `rwkv-sha-pro6000x8`, GPU 0',
+              '- Compute Sanitizer racecheck: `0 errors` for both packed recurrent modes',
               '',
               '```text',
               ...results,

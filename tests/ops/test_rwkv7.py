@@ -13,8 +13,8 @@ import torch.nn.functional as F
 
 from fla.ops.generalized_delta_rule.dplr import chunk_dplr_delta_rule
 from fla.ops.generalized_delta_rule.dplr.fused_recurrent import fused_recurrent_dplr_delta_rule
-from fla.ops.rwkv7 import chunk_rwkv7
 from fla.ops.rwkv7.channel_mixing import channel_mixing_rwkv7, channel_mixing_rwkv7_torch
+from fla.ops.rwkv7.chunk import chunk_rwkv7_reference
 from fla.ops.rwkv7.fused_addcmul import fused_addcmul_rwkv7, torch_addcmul_rwkv7
 from fla.ops.rwkv7.fused_k_update import fused_k_rwkv7, k_update_ref
 from fla.ops.rwkv7.fused_recurrent import fused_mul_recurrent_rwkv7
@@ -140,7 +140,7 @@ def test_fused_mul_recurrent_fwd(
 
 
 @pytest.mark.parametrize('chunk_size', [16, 32, 64])
-def test_chunk_wrapper_chunk_size(chunk_size: int):
+def test_explicit_chunk_oracle_wrapper(chunk_size: int):
     B, T, H, D = 1, 64, 2, 64
     r = torch.empty(B, T, H, D).uniform_(-8, -6).to(device)
     k = torch.empty(B, T, H, D).uniform_(-8, -6).to(device)
@@ -150,7 +150,7 @@ def test_chunk_wrapper_chunk_size(chunk_size: int):
     a = -kk
     b = kk * torch.empty(B, T, H, D).uniform_(0, 0.1).to(device)
 
-    ref, ref_ht = chunk_dplr_delta_rule(
+    expected, expected_state = chunk_dplr_delta_rule(
         q=r.clone(),
         k=k.clone(),
         v=v.clone(),
@@ -161,7 +161,7 @@ def test_chunk_wrapper_chunk_size(chunk_size: int):
         output_final_state=True,
         chunk_size=chunk_size,
     )
-    tri, tri_ht = chunk_rwkv7(
+    actual, actual_state = chunk_rwkv7_reference(
         r=r.clone(),
         w=w.clone(),
         k=k.clone(),
@@ -172,8 +172,8 @@ def test_chunk_wrapper_chunk_size(chunk_size: int):
         chunk_size=chunk_size,
     )
 
-    assert_close('o', ref, tri, 0.002)
-    assert_close('ht', ref_ht, tri_ht, 0.002)
+    assert_close('o', expected, actual, 0.002)
+    assert_close('ht', expected_state, actual_state, 0.002)
 
 
 @pytest.mark.parametrize("B", [1])

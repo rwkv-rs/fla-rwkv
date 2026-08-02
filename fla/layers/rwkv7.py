@@ -20,7 +20,8 @@ from fla.layers.utils import get_layer_cache, update_layer_cache
 from fla.modules import GroupNorm
 from fla.modules.l2norm import l2_norm
 from fla.modules.token_shift import token_shift
-from fla.ops.rwkv7 import chunk_rwkv7, fused_mul_recurrent_rwkv7
+from fla.ops.rwkv7 import fused_mul_recurrent_rwkv7, recurrent_rwkv7
+from fla.ops.rwkv7.chunk import chunk_rwkv7_reference
 from fla.ops.rwkv7.fused_addcmul import fused_addcmul_rwkv7
 from fla.ops.rwkv7.fused_k_update import fused_k_rwkv7
 from fla.ops.rwkv7.gate_output_correction import gate_output_correction
@@ -29,11 +30,68 @@ if TYPE_CHECKING:
     from fla.models.utils import Cache
 
 
+def _run_rwkv7_operator(
+    mode: str,
+    *,
+    r: torch.Tensor,
+    w: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    kk: torch.Tensor,
+    a: torch.Tensor,
+    recurrent_state: torch.Tensor | None,
+    output_final_state: bool,
+    cu_seqlens: torch.LongTensor | None,
+):
+    if mode == 'recurrent':
+        return recurrent_rwkv7(
+            r=r,
+            w=w,
+            k=k,
+            v=v,
+            a=-kk,
+            b=kk * a,
+            scale=1.,
+            initial_state=recurrent_state,
+            output_final_state=output_final_state,
+            cu_seqlens=cu_seqlens,
+        )
+    if mode == 'chunk':
+        return chunk_rwkv7_reference(
+            r=r,
+            w=w,
+            k=k,
+            v=v,
+            a=-kk,
+            b=kk * a,
+            scale=1.,
+            initial_state=recurrent_state,
+            output_final_state=output_final_state,
+            cu_seqlens=cu_seqlens,
+            safe_gate=True,
+            chunk_size=64,
+        )
+    if mode == 'fused_recurrent':
+        return fused_mul_recurrent_rwkv7(
+            r=r,
+            w=w,
+            k=k,
+            v=v,
+            kk=kk,
+            a=a,
+            scale=1.,
+            initial_state=recurrent_state,
+            output_final_state=output_final_state,
+            cu_seqlens=cu_seqlens,
+        )
+    raise ValueError(f"Not supported mode `{mode}`.")
+
+
 class RWKV7Attention(nn.Module):
 
     def __init__(
         self,
-        mode: str = 'chunk',
+        mode: str = 'recurrent',
         hidden_size: int = 1024,
         head_dim: int | None = 64,
         num_heads: int | None = None,
@@ -51,8 +109,9 @@ class RWKV7Attention(nn.Module):
     ) -> RWKV7Attention:
         super().__init__()
 
+        if mode not in ['recurrent', 'chunk', 'fused_recurrent']:
+            raise ValueError(f"Not supported mode `{mode}`.")
         self.mode = mode
-        assert mode in ['chunk', 'fused_recurrent'], f"Not supported mode `{mode}`."
         self.hidden_size = hidden_size
 
         self.key_dim = hidden_size
@@ -302,36 +361,18 @@ class RWKV7Attention(nn.Module):
         r, w, k, a = map(lambda x: rearrange(x, 'b t (h d) -> b t h d', d=self.head_dim), (r, w, k, a))
         v = rearrange(v, 'b t (h d) -> b t h d', d=self.head_v_dim)
 
-        if self.training or seq_len >= 64:
-            # if training, use chunk mode no matter how short the sequence is
-            # launching the triton kernel for just one token will actually be slower
-            o, recurrent_state = chunk_rwkv7(
-                r=r,
-                w=w,
-                k=k,
-                v=v,
-                a=-kk,
-                b=kk * a,
-                scale=1.,
-                initial_state=recurrent_state,
-                output_final_state=use_cache,
-                cu_seqlens=cu_seqlens,
-                safe_gate=True,
-                chunk_size=64,
-            )
-        else:
-            o, recurrent_state = fused_mul_recurrent_rwkv7(
-                r=r,
-                w=w,
-                k=k,
-                v=v,
-                kk=kk,
-                a=a,
-                scale=1.,
-                initial_state=recurrent_state,
-                output_final_state=use_cache,
-                cu_seqlens=cu_seqlens,
-            )
+        o, recurrent_state = _run_rwkv7_operator(
+            self.mode,
+            r=r,
+            w=w,
+            k=k,
+            v=v,
+            kk=kk,
+            a=a,
+            recurrent_state=recurrent_state,
+            output_final_state=use_cache,
+            cu_seqlens=cu_seqlens,
+        )
 
         update_layer_cache(
             self,
