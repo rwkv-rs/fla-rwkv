@@ -15,6 +15,7 @@ on:
       - 'scripts/build_packages.py'
       - 'scripts/run_rwkv7_flash_adapter_ci.py'
       - 'tests/ops/test_rwkv7_backends.py'
+      - 'tests/ops/test_rwkv7_flash_kernel_api.py'
       - 'tests/ops/test_rwkv7.py'
       - 'tests/context_parallel/test_cp_rwkv7.py'
       - 'tests/racecheck/test_rwkv7_flash_adapter.py'
@@ -34,6 +35,7 @@ on:
       - 'scripts/build_packages.py'
       - 'scripts/run_rwkv7_flash_adapter_ci.py'
       - 'tests/ops/test_rwkv7_backends.py'
+      - 'tests/ops/test_rwkv7_flash_kernel_api.py'
       - 'tests/ops/test_rwkv7.py'
       - 'tests/context_parallel/test_cp_rwkv7.py'
       - 'tests/racecheck/test_rwkv7_flash_adapter.py'
@@ -107,10 +109,13 @@ jobs:
             fla/ops/rwkv7/__init__.py \
             fla/ops/rwkv7/backends \
             fla/ops/rwkv7/chunk.py \
+            fla/ops/rwkv7/flash_rwkv.py \
+            fla/ops/rwkv7/inference.py \
             fla/ops/rwkv7/recurrent.py \
             scripts/build_packages.py \
             scripts/run_rwkv7_flash_adapter_ci.py \
             tests/ops/test_rwkv7_backends.py \
+            tests/ops/test_rwkv7_flash_kernel_api.py \
             tests/ops/test_rwkv7.py \
             tests/context_parallel/test_cp_rwkv7.py \
             tests/racecheck/test_rwkv7_flash_adapter.py \
