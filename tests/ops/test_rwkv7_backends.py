@@ -771,7 +771,7 @@ def rwkv7_recurrent_stateful(
 
 def pretrain_recurrent_fp32io16_forward(
     r, decay_logits, k, v, a, b, *, scale, initial_state,
-    output_final_state, decay_bias, elapsed_t,
+    output_final_state,
 ):
     pass
 
@@ -1121,6 +1121,33 @@ def test_recurrent_rwkv7_dispatches_gradients_to_exact_recurrent_autograd(monkey
     assert get_last_rwkv7_provider() == "flash_rwkv"
     assert len(calls) == 1
     assert calls[0][1]["output_final_state"] is True
+    assert "decay_bias" not in calls[0][1]
+    assert "elapsed_t" not in calls[0][1]
+
+
+def test_recurrent_rwkv7_training_rejects_inference_only_decay_inputs(monkeypatch):
+    fake_provider = SimpleNamespace(
+        pretrain_recurrent_fp32io16_forward=lambda *args, **kwargs: pytest.fail(
+            "training provider must not receive inference-only decay inputs"
+        )
+    )
+    _admit_fake_provider(monkeypatch, fake_provider)
+
+    for inference_only in (
+        {"decay_bias": _tensor(shape=(2, 64))},
+        {"elapsed_t": object()},
+    ):
+        with pytest.raises(
+            ValueError,
+            match="training requires combined decay_logits",
+        ):
+            recurrent_rwkv7(
+                **_call_args(r=_tensor(requires_grad=True)),
+                **inference_only,
+            )
+
+    assert get_last_rwkv7_provider() is None
+    assert get_last_rwkv7_kernel() is None
 
 
 def test_public_recurrent_verifier_rejection_fails_closed(monkeypatch):

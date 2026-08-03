@@ -218,8 +218,6 @@ def _validate_public_api(module: ModuleType) -> None:
         "scale",
         "initial_state",
         "output_final_state",
-        "decay_bias",
-        "elapsed_t",
     }
     required_prepare_metadata_parameters = {
         "cu_seqlens",
@@ -671,6 +669,10 @@ class FlashRWKVBackend(BaseBackend):
             )
             output = (output, initial_state)
         elif requires_grad:
+            if decay_bias is not None or elapsed_t is not None:
+                raise ValueError(
+                    "training requires combined decay_logits and does not accept decay_bias or elapsed_t"
+                )
             kernel = "pretrain_recurrent_fp32io16_forward"
             output = flash_rwkv.pretrain_recurrent_fp32io16_forward(
                 r,
@@ -682,8 +684,6 @@ class FlashRWKVBackend(BaseBackend):
                 scale=scale,
                 initial_state=initial_state,
                 output_final_state=output_final_state,
-                decay_bias=decay_bias,
-                elapsed_t=elapsed_t,
             )
         else:
             kernel = "rwkv7_recurrent"
