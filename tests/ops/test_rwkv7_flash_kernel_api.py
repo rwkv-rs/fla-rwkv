@@ -33,7 +33,7 @@ EXPECTED_PARAMETERS = {
     "pretrain_cmix_bf16": ("x", "x_k", "key_weight", "value_weight"),
     "pretrain_head_l2wrap_ce_bf16": ("hidden", "weight", "targets", "chunk_rows"),
     "pretrain_l2wrap_ce_bf16": ("logits", "targets"),
-    "pretrain_recurrent_fp32io16_from_decay_logits": (
+    "pretrain_recurrent_fp32io16_forward": (
         "r", "decay_logits", "k", "v", "a", "b", "scale", "initial_state", "output_final_state",
         "decay_bias", "elapsed_t",
     ),
@@ -47,16 +47,16 @@ EXPECTED_PARAMETERS = {
     "prepare_recurrent_metadata": (
         "cu_seqlens", "state_indices", "total_tokens", "state_pool_size",
     ),
-    "rwkv7_from_decay_logits": (
+    "rwkv7": (
         "r", "decay_logits", "k", "v", "a", "b", "scale", "initial_state", "output_final_state",
         "cu_seqlens", "state_indices", "mode", "algorithm", "chunk_size", "chunk_config", "decay_bias",
         "elapsed_t", "validated_metadata",
     ),
-    "rwkv7_recurrent_from_decay_logits": (
+    "rwkv7_recurrent": (
         "r", "decay_logits", "k", "v", "a", "b", "scale", "initial_state", "output_final_state",
         "cu_seqlens", "state_indices", "mode", "decay_bias", "elapsed_t", "validated_metadata",
     ),
-    "rwkv7_recurrent_stateful_from_decay_logits": (
+    "rwkv7_recurrent_stateful": (
         "r", "decay_logits", "k", "v", "a", "b", "state_pool", "cu_seqlens", "state_indices", "scale",
         "mode", "decay_bias", "elapsed_t", "validated_metadata",
     ),
@@ -83,6 +83,14 @@ def test_complete_flash_rwkv_operator_suite_is_public_through_fla():
         operator = getattr(flash_api, name)
         assert callable(operator)
         assert tuple(inspect.signature(operator).parameters) == parameters
+
+    assert {
+        "pretrain_recurrent_fp32io16_forward",
+        "rwkv7",
+        "rwkv7_recurrent",
+        "rwkv7_recurrent_stateful",
+    } <= set(flash_api.__all__)
+    assert all("from_decay_logits" not in name for name in flash_api.__all__)
 
 
 def test_every_public_flash_rwkv_operator_routes_to_its_exact_provider_entrypoint(monkeypatch):
@@ -136,6 +144,38 @@ def test_provider_namespace_preflights_then_records_exact_operator(monkeypatch):
     assert calls == [("preflight",), ("import", "flash_rwkv"), ("provider", a0, a12)]
     assert get_last_rwkv7_provider() == "flash_rwkv"
     assert get_last_rwkv7_kernel() == "pretrain_tmix_a_gate_bf16"
+
+
+def test_standard_rwkv7_facade_defaults_to_auto_fused_provider_and_exact_telemetry(monkeypatch):
+    calls = []
+    expected = object()
+
+    def provider_rwkv7(*args, **kwargs):
+        calls.append((args, kwargs))
+        return expected
+
+    provider = SimpleNamespace(rwkv7=provider_rwkv7)
+    monkeypatch.setattr(flash_api, "preflight_flash_rwkv_installation", lambda: None)
+    monkeypatch.setattr(flash_api.importlib, "import_module", lambda name: provider)
+
+    operands = tuple(object() for _ in range(6))
+    assert flash_api.rwkv7(*operands) is expected
+    assert calls == [(operands, {
+        "scale": 1.0,
+        "initial_state": None,
+        "output_final_state": False,
+        "cu_seqlens": None,
+        "state_indices": None,
+        "mode": "fp32io16",
+        "algorithm": "auto",
+        "chunk_size": None,
+        "chunk_config": None,
+        "decay_bias": None,
+        "elapsed_t": None,
+        "validated_metadata": None,
+    })]
+    assert get_last_rwkv7_provider() == "flash_rwkv"
+    assert get_last_rwkv7_kernel() == "rwkv7"
 
 
 def test_provider_namespace_fails_closed_before_import(monkeypatch):
