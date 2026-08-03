@@ -123,7 +123,7 @@ def test_every_public_flash_rwkv_operator_routes_to_its_exact_provider_entrypoin
     assert [call[0] for call in calls] == list(flash_backend.FLASH_RWKV_REQUIRED_OPERATORS)
 
 
-def test_provider_namespace_preflights_then_records_exact_operator(monkeypatch):
+def test_provider_namespace_loads_admitted_provider_then_records_exact_operator(monkeypatch):
     calls = []
     expected = object()
     provider = SimpleNamespace(
@@ -131,16 +131,15 @@ def test_provider_namespace_preflights_then_records_exact_operator(monkeypatch):
             calls.append(("provider", a0, a12)) or expected
         )
     )
-    monkeypatch.setattr(flash_api, "preflight_flash_rwkv_installation", lambda: calls.append(("preflight",)))
     monkeypatch.setattr(
-        flash_api.importlib,
-        "import_module",
-        lambda name: calls.append(("import", name)) or provider,
+        flash_api,
+        "_load_flash_rwkv_provider",
+        lambda: calls.append(("load",)) or provider,
     )
 
     a0, a12 = object(), object()
     assert flash_api.pretrain_tmix_a_gate_bf16(a0, a12) is expected
-    assert calls == [("preflight",), ("import", "flash_rwkv"), ("provider", a0, a12)]
+    assert calls == [("load",), ("provider", a0, a12)]
     assert get_last_rwkv7_provider() == "flash_rwkv"
     assert get_last_rwkv7_kernel() == "pretrain_tmix_a_gate_bf16"
 
@@ -154,8 +153,7 @@ def test_standard_rwkv7_facade_defaults_to_auto_fused_provider_and_exact_telemet
         return expected
 
     provider = SimpleNamespace(rwkv7=provider_rwkv7)
-    monkeypatch.setattr(flash_api, "preflight_flash_rwkv_installation", lambda: None)
-    monkeypatch.setattr(flash_api.importlib, "import_module", lambda name: provider)
+    monkeypatch.setattr(flash_api, "_load_flash_rwkv_provider", lambda: provider)
 
     operands = tuple(object() for _ in range(6))
     assert flash_api.rwkv7(*operands) is expected
@@ -177,18 +175,13 @@ def test_standard_rwkv7_facade_defaults_to_auto_fused_provider_and_exact_telemet
     assert get_last_rwkv7_kernel() == "rwkv7"
 
 
-def test_provider_namespace_fails_closed_before_import(monkeypatch):
+def test_provider_namespace_fails_closed_before_operator_lookup(monkeypatch):
     set_last_rwkv7_provider("stale")
     set_last_rwkv7_kernel("stale")
     monkeypatch.setattr(
         flash_api,
-        "preflight_flash_rwkv_installation",
+        "_load_flash_rwkv_provider",
         lambda: (_ for _ in ()).throw(flash_backend.FlashRWKVProvenanceError("wrong revision")),
-    )
-    monkeypatch.setattr(
-        flash_api.importlib,
-        "import_module",
-        lambda name: pytest.fail(f"unexpected provider import: {name}"),
     )
 
     with pytest.raises(flash_backend.FlashRWKVProvenanceError, match="wrong revision"):

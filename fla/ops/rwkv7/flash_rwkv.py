@@ -15,7 +15,6 @@ variants.
 
 from __future__ import annotations
 
-import importlib
 from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any
 
@@ -24,7 +23,7 @@ import torch
 from fla.ops.rwkv7.backends.flash_rwkv import (
     FLASH_RWKV_PUBLIC_OPERATORS,
     FLASH_RWKV_REQUIRED_OPERATORS,
-    preflight_flash_rwkv_installation,
+    _load_flash_rwkv_provider,
 )
 from fla.ops.rwkv7.backends.provider import (
     set_last_rwkv7_kernel,
@@ -40,8 +39,7 @@ def _invoke(operator: str, *args, **kwargs) -> Any:
         raise RuntimeError(f"unregistered FlashRWKV operator: {operator}")
     set_last_rwkv7_provider(None)
     set_last_rwkv7_kernel(None)
-    preflight_flash_rwkv_installation()
-    provider = importlib.import_module("flash_rwkv")
+    provider = _load_flash_rwkv_provider()
     result = getattr(provider, operator)(*args, **kwargs)
     set_last_rwkv7_provider("flash_rwkv")
     set_last_rwkv7_kernel(operator)
