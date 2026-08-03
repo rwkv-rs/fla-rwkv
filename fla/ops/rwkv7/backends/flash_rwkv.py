@@ -36,7 +36,7 @@ from fla.ops.rwkv7.backends.provider import (
 if TYPE_CHECKING:
     from fla.ops.cp import FLACPContext
 
-FLASH_RWKV_SOURCE_REVISION = "5410491f0d6cff6058e5bd21cbab900b5b54f220"
+FLASH_RWKV_SOURCE_REVISION = "8b3d08a9a9430df23fb9da9b35fb0aa625faa1fb"
 FLASH_RWKV_REPOSITORY = "https://github.com/rwkv-rs/FlashRWKV.git"
 FLASH_RWKV_REQUIRED_OPERATORS = (
     "infer_cmix_mix_fp16",
@@ -711,6 +711,7 @@ class FlashRWKVBackend(BaseBackend):
         set_last_rwkv7_provider("flash_rwkv")
         set_last_rwkv7_kernel(kernel)
         return output
+
 
 __all__ = [
     "FLASH_RWKV_PUBLIC_OPERATORS",
