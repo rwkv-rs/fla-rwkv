@@ -24,18 +24,14 @@ from types import ModuleType
 
 import torch
 
-from fla.ops.rwkv7 import get_last_rwkv7_provider, recurrent_rwkv7
-from fla.ops.rwkv7.backends.flash_rwkv import (
-    FLASH_RWKV_SOURCE_REVISION,
-    validate_flash_rwkv_installation,
+from fla.ops.rwkv7 import (
+    get_last_rwkv7_kernel,
+    get_last_rwkv7_provider,
+    prepare_rwkv7_recurrent_metadata,
+    recurrent_rwkv7,
 )
+from fla.ops.rwkv7.backends.flash_rwkv import validate_flash_rwkv_installation
 
-FLASH_RWKV_EVIDENCE_REVISION = "c2566924c567b4cff9f7327daf6e61b57fef210b"
-FLASH_RWKV_EVIDENCE_RUN_ID = 30764328420
-FLASH_RWKV_EVIDENCE_ARTIFACT_ID = 8838645629
-FLASH_RWKV_EVIDENCE_ARTIFACT_DIGEST = (
-    "sha256:50f7836249bd63421f0d014ff88fc20a633938a2787aced0e4c73849e3ecc689"
-)
 HEAD_SIZE = 64
 PROFILES: dict[str, tuple[int, ...]] = {
     "decode_b320": (1,) * 320,
@@ -65,9 +61,11 @@ class Payload:
     offsets: tuple[int, ...]
     state_slots: tuple[int, ...]
     inputs: tuple[torch.Tensor, ...]
+    decay_bias: torch.Tensor
     cu_seqlens: torch.Tensor
     state_indices: torch.Tensor
     initial_state_pool: torch.Tensor
+    elapsed_t: torch.Tensor | None
 
     @property
     def total_tokens(self) -> int:
@@ -149,6 +147,15 @@ def _make_payload(
         ).to(torch.float16),
         *inputs[2:],
     )
+    decay_bias = (
+        0.05
+        * torch.randn(
+            (heads, HEAD_SIZE),
+            device="cuda",
+            dtype=torch.float32,
+            generator=generator,
+        )
+    ).to(torch.float16).contiguous()
     offsets = [0]
     for length in sequence_lengths:
         offsets.append(offsets[-1] + length)
@@ -165,19 +172,30 @@ def _make_payload(
             generator=generator,
         )
     ).to(state_dtype)
+    elapsed_t = (
+        torch.zeros(
+            initial_state_pool.shape[0],
+            device="cuda",
+            dtype=torch.int32,
+        )
+        if mode == "fp16"
+        else None
+    )
     return Payload(
         sequence_lengths=sequence_lengths,
         offsets=tuple(offsets),
         state_slots=state_slots,
         inputs=inputs,
+        decay_bias=decay_bias,
         cu_seqlens=cu_seqlens,
         state_indices=state_indices,
         initial_state_pool=initial_state_pool,
+        elapsed_t=elapsed_t,
     )
 
 
 def _oracle(payload: Payload) -> tuple[torch.Tensor, torch.Tensor]:
-    r, w, k, v, a, b = (tensor[0] for tensor in payload.inputs)
+    r, decay_logits, k, v, a, b = (tensor[0] for tensor in payload.inputs)
     state_pool = payload.initial_state_pool.float().clone()
     output = torch.empty_like(v, dtype=torch.float32)
     max_length = max(payload.sequence_lengths)
@@ -199,14 +217,17 @@ def _oracle(payload: Payload) -> tuple[torch.Tensor, torch.Tensor]:
         )
         previous_state = state_pool.index_select(0, slots)
         token_r = r.index_select(0, token_indices).float()
-        token_w = w.index_select(0, token_indices).float()
+        token_decay_logits = decay_logits.index_select(0, token_indices).float()
+        token_log_decay = -0.6065306597126334 * (
+            token_decay_logits + payload.decay_bias.float()
+        ).sigmoid()
         token_k = k.index_select(0, token_indices).float()
         token_v = v.index_select(0, token_indices).float()
         token_a = a.index_select(0, token_indices).float()
         token_b = b.index_select(0, token_indices).float()
         a_state = torch.einsum("nhk,nhkv->nhv", token_a, previous_state)
         updated_state = (
-            token_w.exp().unsqueeze(-1) * previous_state
+            token_log_decay.exp().unsqueeze(-1) * previous_state
             + token_b.unsqueeze(-1) * a_state.unsqueeze(-2)
             + token_k.unsqueeze(-1) * token_v.unsqueeze(-2)
         )
@@ -224,6 +245,7 @@ def _launch(
     state_pool: torch.Tensor,
     *,
     mode: str,
+    validated_metadata: object,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     output, final_state = recurrent_rwkv7(
         *payload.inputs,
@@ -232,30 +254,105 @@ def _launch(
         cu_seqlens=payload.cu_seqlens,
         state_indices=payload.state_indices,
         mode=mode,
+        decay_bias=payload.decay_bias,
+        elapsed_t=payload.elapsed_t,
+        validated_metadata=validated_metadata,
     )
     if get_last_rwkv7_provider() != "flash_rwkv":
         raise RuntimeError("public packed call did not select FlashRWKV")
+    if get_last_rwkv7_kernel() != "rwkv7_recurrent_stateful":
+        raise RuntimeError("public packed call did not select the fused stateful kernel")
     if final_state is not state_pool:
         raise RuntimeError("public packed call did not return its input state pool")
     return output, final_state
+
+
+def _kernel_launch_trace(
+    payload: Payload,
+    *,
+    mode: str,
+    validated_metadata: object,
+) -> dict[str, object]:
+    state_pool = payload.initial_state_pool.clone()
+    with torch.profiler.profile(
+        activities=[
+            torch.profiler.ProfilerActivity.CPU,
+            torch.profiler.ProfilerActivity.CUDA,
+        ],
+    ) as profiler:
+        _launch(
+            payload,
+            state_pool,
+            mode=mode,
+            validated_metadata=validated_metadata,
+        )
+        torch.cuda.synchronize()
+    kernel_names = [
+        event.name
+        for event in profiler.events()
+        if event.device_type == torch.autograd.DeviceType.CUDA
+    ]
+    expected_wkv = (
+        "recurrent_fp32_kernel"
+        if mode == "fp32io16"
+        else (
+            "recurrent_fp16_kernel"
+            if payload.inputs[0].shape[-1] == 64
+            else "recurrent_fp16_generic_kernel"
+        )
+    )
+    wkv_launches = sum(expected_wkv in name for name in kernel_names)
+    validator_launches = sum(
+        "validate_recurrent_metadata_kernel" in name
+        for name in kernel_names
+    )
+    if len(kernel_names) != 1 or wkv_launches != 1 or validator_launches != 0:
+        raise RuntimeError(
+            "prevalidated packed launch structure regressed: "
+            f"kernels={kernel_names} expected_wkv={expected_wkv}"
+        )
+    return {
+        "total_cuda_kernel_launches": len(kernel_names),
+        "wkv_kernel_launches": wkv_launches,
+        "metadata_validator_launches": validator_launches,
+        "expected_wkv_kernel_substring": expected_wkv,
+        "cuda_kernel_names": kernel_names,
+        "decay_pointwise_launches": 0,
+    }
 
 
 def _cuda_graph_evidence(
     payload: Payload,
     *,
     mode: str,
-    observed: dict[str, torch.Tensor],
+    observed: dict[str, object],
 ) -> dict[str, object]:
     state_pool = payload.initial_state_pool.clone()
-    warmup_stream = torch.cuda.Stream()
-    warmup_stream.wait_stream(torch.cuda.current_stream())
-    with torch.cuda.stream(warmup_stream):
+    capture_stream = torch.cuda.Stream()
+    capture_stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(capture_stream):
+        validated_metadata = prepare_rwkv7_recurrent_metadata(
+            payload.cu_seqlens,
+            payload.state_indices,
+            total_tokens=payload.total_tokens,
+            state_pool_size=payload.initial_state_pool.shape[0],
+        )
         for _ in range(3):
-            _launch(payload, state_pool, mode=mode)
-    torch.cuda.current_stream().wait_stream(warmup_stream)
+            _launch(
+                payload,
+                state_pool,
+                mode=mode,
+                validated_metadata=validated_metadata,
+            )
+    torch.cuda.current_stream().wait_stream(capture_stream)
     graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        captured_output, captured_state = _launch(payload, state_pool, mode=mode)
+    with torch.cuda.graph(graph, stream=capture_stream):
+        captured_output, captured_state = _launch(
+            payload,
+            state_pool,
+            mode=mode,
+            validated_metadata=validated_metadata,
+        )
     graph.replay()
     torch.cuda.synchronize()
     return {
@@ -266,6 +363,7 @@ def _cuda_graph_evidence(
         "state_indices_identity_preserved": observed.get("state_indices") is payload.state_indices,
         "cu_seqlens_data_ptr": payload.cu_seqlens.data_ptr(),
         "state_indices_data_ptr": payload.state_indices.data_ptr(),
+        "metadata_prepared_on_capture_stream": True,
         "interpretation": (
             "CUDA Graph capture through fla.ops.rwkv7.recurrent_rwkv7 proves the "
             "packed launch boundary performs no device-to-host synchronization"
@@ -282,7 +380,7 @@ def _run_case(
     warmup: int,
     iters: int,
     seed: int,
-    observed: dict[str, torch.Tensor],
+    observed: dict[str, object],
 ) -> dict[str, object]:
     payload = _make_payload(
         PROFILES[profile],
@@ -290,12 +388,15 @@ def _run_case(
         mode=mode,
         seed=seed,
     )
-    provider_module.validate_packed_metadata_strict(
+    prepare_calls_before = int(observed.get("prepare_calls", 0))
+    validated_metadata = prepare_rwkv7_recurrent_metadata(
         payload.cu_seqlens,
         payload.state_indices,
         total_tokens=payload.total_tokens,
         state_pool_size=payload.initial_state_pool.shape[0],
     )
+    if int(observed.get("prepare_calls", 0)) != prepare_calls_before + 1:
+        raise RuntimeError("packed metadata was not prepared exactly once per case")
     expected_output, expected_pool = _oracle(payload)
     first_pool = payload.initial_state_pool.clone()
     second_pool = payload.initial_state_pool.clone()
@@ -305,13 +406,23 @@ def _run_case(
         device="cuda",
         dtype=torch.long,
     )
-    first_output, first_final_state = _launch(payload, first_pool, mode=mode)
+    first_output, first_final_state = _launch(
+        payload,
+        first_pool,
+        mode=mode,
+        validated_metadata=validated_metadata,
+    )
     first_call_identity_preserved = bool(
         observed.get("state_pool") is first_pool
         and observed.get("cu_seqlens") is payload.cu_seqlens
         and observed.get("state_indices") is payload.state_indices
     )
-    second_output, _ = _launch(payload, second_pool, mode=mode)
+    second_output, _ = _launch(
+        payload,
+        second_pool,
+        mode=mode,
+        validated_metadata=validated_metadata,
+    )
     torch.cuda.synchronize()
     active_slots = payload.state_indices.long()
     output_error = _relative_rmse(first_output, expected_output)
@@ -357,21 +468,40 @@ def _run_case(
     measurement_pool = payload.initial_state_pool.clone()
     for _ in range(warmup):
         measurement_pool.copy_(payload.initial_state_pool)
-        _launch(payload, measurement_pool, mode=mode)
+        _launch(
+            payload,
+            measurement_pool,
+            mode=mode,
+            validated_metadata=validated_metadata,
+        )
     torch.cuda.synchronize()
     samples = []
     for _ in range(iters):
         measurement_pool.copy_(payload.initial_state_pool)
         torch.cuda.synchronize()
         start = time.perf_counter_ns()
-        _launch(payload, measurement_pool, mode=mode)
+        _launch(
+            payload,
+            measurement_pool,
+            mode=mode,
+            validated_metadata=validated_metadata,
+        )
         torch.cuda.synchronize()
         samples.append((time.perf_counter_ns() - start) / 1e6)
     p10 = _percentile(samples, 0.1)
     p50 = statistics.median(samples)
     p90 = _percentile(samples, 0.9)
+    launch_trace = _kernel_launch_trace(
+        payload,
+        mode=mode,
+        validated_metadata=validated_metadata,
+    )
     graph_evidence = (
-        _cuda_graph_evidence(payload, mode=mode, observed=observed)
+        _cuda_graph_evidence(
+            payload,
+            mode=mode,
+            observed=observed,
+        )
         if profile == "decode_b320"
         else None
     )
@@ -380,8 +510,9 @@ def _run_case(
         "profile": profile,
         "mode": mode,
         "provider": "flash_rwkv",
+        "kernel": "rwkv7_recurrent_stateful",
         "public_api": "fla.ops.rwkv7.recurrent_rwkv7",
-        "oracle": "explicit-pytorch-recurrence",
+        "oracle": "independent-raw-decay-transform-plus-pytorch-recurrence",
         "B": len(payload.sequence_lengths),
         "T": payload.total_tokens,
         "H": hidden_size // HEAD_SIZE,
@@ -390,6 +521,9 @@ def _run_case(
         "state_slot_mapping": "reverse sequence order with seven untouched rows",
         "state_dtype": str(payload.initial_state_pool.dtype),
         "token_dtype": str(payload.inputs[0].dtype),
+        "decay_bias_shape": list(payload.decay_bias.shape),
+        "decay_bias_fused": True,
+        "elapsed_t_phase_base": payload.elapsed_t is not None,
         "warmup": warmup,
         "iters": iters,
         "p10_ms": p10,
@@ -416,14 +550,17 @@ def _run_case(
             "cu_seqlens_identity_preserved": observed.get("cu_seqlens") is payload.cu_seqlens,
             "state_indices_identity_preserved": observed.get("state_indices") is payload.state_indices,
             "cuda_graph_evidence": graph_evidence,
+            "metadata_prepare_calls": 1,
+            "validated_metadata_reused": True,
         },
+        "launch_trace": launch_trace,
         "measurement": {
             "included": (
-                "public recurrent_rwkv7 dispatch, provenance identity check, FlashRWKV "
-                "packed provider launch, and device synchronization"
+                "public raw-decay recurrent_rwkv7 dispatch, provenance identity check, "
+                "fused FlashRWKV decay transform plus packed provider launch, and device synchronization"
             ),
             "excluded": (
-                "input allocation, strict debug metadata validation, oracle, "
+                "input allocation, one-time native metadata preparation, oracle, "
                 "state reset, warmup, and serialization"
             ),
         },
@@ -476,8 +613,9 @@ def main() -> None:
             f"provider revision mismatch: expected={args.expected_provider_revision} actual={provenance.revision}"
         )
 
-    observed: dict[str, torch.Tensor] = {}
+    observed: dict[str, object] = {"prepare_calls": 0}
     original = provider_module.rwkv7_recurrent_stateful
+    original_prepare = provider_module.prepare_recurrent_metadata
 
     @wraps(original)
     def observe_metadata(*call_args, **call_kwargs):
@@ -486,7 +624,13 @@ def main() -> None:
         observed["state_indices"] = call_kwargs["state_indices"]
         return original(*call_args, **call_kwargs)
 
+    @wraps(original_prepare)
+    def observe_prepare(*call_args, **call_kwargs):
+        observed["prepare_calls"] = int(observed["prepare_calls"]) + 1
+        return original_prepare(*call_args, **call_kwargs)
+
     provider_module.rwkv7_recurrent_stateful = observe_metadata
+    provider_module.prepare_recurrent_metadata = observe_prepare
     try:
         results = [
             _run_case(
@@ -503,6 +647,7 @@ def main() -> None:
         ]
     finally:
         provider_module.rwkv7_recurrent_stateful = original
+        provider_module.prepare_recurrent_metadata = original_prepare
     payload = {
         "schema_version": 1,
         "benchmark": "fla_rwkv7_flash_packed_serving",
@@ -511,13 +656,6 @@ def main() -> None:
         "flash_rwkv_source_revision": provenance.revision,
         "flash_rwkv_repository": provenance.repository,
         "flash_rwkv_native_extension": str(provenance.native_extension_path),
-        "flash_rwkv_clean_evidence": {
-            "evidence_revision": FLASH_RWKV_EVIDENCE_REVISION,
-            "workflow_run_id": FLASH_RWKV_EVIDENCE_RUN_ID,
-            "artifact_id": FLASH_RWKV_EVIDENCE_ARTIFACT_ID,
-            "artifact_digest": FLASH_RWKV_EVIDENCE_ARTIFACT_DIGEST,
-            "runtime_semantic_revision": FLASH_RWKV_SOURCE_REVISION,
-        },
         "runner_label": args.runner_label,
         "hardware": _hardware(args.runner_label),
         "mode": args.mode,

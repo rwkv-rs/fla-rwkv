@@ -13,11 +13,20 @@ import torch
 # tests/context_parallel is on sys.path under pytest (see pyproject pythonpath)
 from test_cp_dplr import run_cp_test_with_spawn
 
-from fla.ops.rwkv7 import chunk_rwkv7
+from fla.ops.generalized_delta_rule import chunk_dplr_delta_rule
 
 
 def _explicit_chunk_oracle(q, k, v, a, b, gk, scale=None, **kwargs):
-    return chunk_rwkv7(r=q, w=gk, k=k, v=v, a=a, b=b, scale=scale, **kwargs)
+    return chunk_dplr_delta_rule(
+        q=q,
+        gk=gk,
+        k=k,
+        v=v,
+        a=a,
+        b=b,
+        scale=scale,
+        **kwargs,
+    )
 
 
 def test_cp2_explicit_oracle_sequence_cut():

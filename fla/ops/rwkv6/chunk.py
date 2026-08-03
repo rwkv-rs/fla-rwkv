@@ -30,6 +30,7 @@ BV_LIST = [32, 64] if check_shared_mem() else [16, 32]
 @triton.heuristics({
     'HAS_SCALE': lambda args: args['scale'] is not None,
     'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
+    'HAS_DECAY_BIAS': lambda args: args['decay_bias'] is not None,
 })
 @triton.autotune(
     configs=[
@@ -38,12 +39,13 @@ BV_LIST = [32, 64] if check_shared_mem() else [16, 32]
         for num_warps in [4, 8, 16]
         for num_stages in [2, 3, 4]
     ],
-    key=['S', 'BT', 'HAS_SCALE'],
+    key=['S', 'BT', 'HAS_SCALE', 'HAS_DECAY_BIAS', 'RWKV7_DECAY_LOGITS'],
     **autotune_cache_kwargs,
 )
 @triton.jit(do_not_specialize=['T'])
 def chunk_rwkv6_fwd_cumsum_kernel(
     s,
+    decay_bias,
     oi,
     oe,
     scale,
@@ -56,6 +58,8 @@ def chunk_rwkv6_fwd_cumsum_kernel(
     BS: tl.constexpr,
     HAS_SCALE: tl.constexpr,
     IS_VARLEN: tl.constexpr,
+    HAS_DECAY_BIAS: tl.constexpr,
+    RWKV7_DECAY_LOGITS: tl.constexpr,
 ):
     i_s, i_t, i_bh = tl.program_id(0), tl.program_id(1).to(tl.int64), tl.program_id(2).to(tl.int64)
     i_b, i_h = i_bh // H, i_bh % H
@@ -78,6 +82,15 @@ def chunk_rwkv6_fwd_cumsum_kernel(
     p_oe = oe + (bos * H + i_h) * S + o_t[:, None] * (H*S) + o_s[None, :]
     # [BT, BS]
     b_s = tl.load(p_s, mask=m_s, other=0.0).to(tl.float32)
+    if RWKV7_DECAY_LOGITS:
+        # RWKV7 checkpoints produce raw z. Fuse L = -exp(-0.5) * sigmoid(z)
+        # before the existing log2 cumsum so no canonical log-decay tensor is
+        # materialized by the Python producer.
+        if HAS_DECAY_BIAS:
+            p_decay_bias = decay_bias + i_h * S + o_s
+            b_decay_bias = tl.load(p_decay_bias, mask=o_s < S, other=0.0).to(tl.float32)
+            b_s += b_decay_bias[None, :]
+        b_s = -0.6065306597126334 * tl.sigmoid(b_s)
     b_oi = tl.dot(m_i, b_s)
     b_oe = tl.dot(m_e, b_s)
     if HAS_SCALE:
@@ -94,6 +107,8 @@ def chunk_rwkv6_fwd_cumsum(
     scale: float | None = None,
     cu_seqlens: torch.Tensor | None = None,
     chunk_indices: torch.Tensor | None = None,
+    rwkv7_decay_logits: bool = False,
+    decay_bias: torch.Tensor | None = None,
 ) -> torch.Tensor:
     B, T, H, S = g.shape
     BT = chunk_size
@@ -106,6 +121,7 @@ def chunk_rwkv6_fwd_cumsum(
     # keep cummulative normalizer in fp32
     chunk_rwkv6_fwd_cumsum_kernel[grid](
         g,
+        decay_bias,
         gi,
         ge,
         scale,
@@ -115,6 +131,7 @@ def chunk_rwkv6_fwd_cumsum(
         H=H,
         S=S,
         BT=BT,
+        RWKV7_DECAY_LOGITS=rwkv7_decay_logits,
     )
     return gi, ge
 

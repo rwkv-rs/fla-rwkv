@@ -23,22 +23,7 @@ from fla.ops.rwkv7.backends.provider import (
 )
 
 EXPECTED_PARAMETERS = {
-    "decay_logits_to_log_decay": ("decay_logits",),
-    "infer_chunk_bf16_forward": (
-        "r", "log_decay", "k", "v", "a", "b", "initial_state", "scale", "output_final_state",
-    ),
-    "infer_chunk_bf16_forward_varlen": (
-        "r", "log_decay", "k", "v", "a", "b", "initial_state", "cu_seqlens", "scale", "output_final_state",
-    ),
     "infer_cmix_mix_fp16": ("x", "shift_state", "mix"),
-    "infer_recurrent_fp16_forward_varlen": (
-        "r", "log_decay", "k", "v", "a", "b", "initial_state", "cu_seqlens", "state_indices", "scale",
-        "output_final_state",
-    ),
-    "infer_recurrent_fp32io16_forward_varlen": (
-        "r", "log_decay", "k", "v", "a", "b", "initial_state", "cu_seqlens", "state_indices", "scale",
-        "output_final_state",
-    ),
     "infer_tmix_kk_a_gate_fp16": ("key", "key_scale", "gate_bias", "gate_delta", "key_gate_scale"),
     "infer_tmix_lnx_rkvres_xg_fp16": (
         "recurrent_output", "receptance", "key", "value", "residual_scale", "norm_weight", "norm_bias", "gate",
@@ -48,11 +33,9 @@ EXPECTED_PARAMETERS = {
     "pretrain_cmix_bf16": ("x", "x_k", "key_weight", "value_weight"),
     "pretrain_head_l2wrap_ce_bf16": ("hidden", "weight", "targets", "chunk_rows"),
     "pretrain_l2wrap_ce_bf16": ("logits", "targets"),
-    "pretrain_recurrent_fp32io16": (
-        "r", "log_decay", "k", "v", "a", "b", "scale", "initial_state", "output_final_state",
-    ),
-    "pretrain_recurrent_fp32io16_forward": (
-        "r", "log_decay", "k", "v", "a", "b", "scale", "initial_state", "output_final_state",
+    "pretrain_recurrent_fp32io16_from_decay_logits": (
+        "r", "decay_logits", "k", "v", "a", "b", "scale", "initial_state", "output_final_state",
+        "decay_bias", "elapsed_t",
     ),
     "pretrain_tmix_a_gate_bf16": ("a0", "a12"),
     "pretrain_tmix_kk_pre_bf16": ("key", "key_scale", "learning_rate", "learning_rate_scale"),
@@ -61,29 +44,33 @@ EXPECTED_PARAMETERS = {
     ),
     "pretrain_tmix_mix6_bf16": ("x", "x_r", "x_w", "x_k", "x_v", "x_a", "x_g"),
     "pretrain_tmix_vres_gate_bf16": ("value", "first_value", "v0", "v12"),
-    "rl_infctx_chunk_fp32io16_factor_recompute": (
-        "r", "log_decay", "k", "v", "a", "b", "scale", "initial_state", "output_final_state", "cu_seqlens",
-        "state_indices", "chunk_size",
-    ),
-    "rwkv7": (
-        "r", "log_decay", "k", "v", "a", "b", "scale", "initial_state", "output_final_state", "cu_seqlens",
-        "state_indices", "mode", "algorithm", "chunk_size", "chunk_config",
+    "prepare_recurrent_metadata": (
+        "cu_seqlens", "state_indices", "total_tokens", "state_pool_size",
     ),
     "rwkv7_from_decay_logits": (
         "r", "decay_logits", "k", "v", "a", "b", "scale", "initial_state", "output_final_state",
-        "cu_seqlens", "state_indices", "mode", "algorithm", "chunk_size", "chunk_config",
+        "cu_seqlens", "state_indices", "mode", "algorithm", "chunk_size", "chunk_config", "decay_bias",
+        "elapsed_t", "validated_metadata",
     ),
-    "rwkv7_recurrent_stateful": (
-        "r", "log_decay", "k", "v", "a", "b", "state_pool", "cu_seqlens", "state_indices", "scale", "mode",
+    "rwkv7_recurrent_from_decay_logits": (
+        "r", "decay_logits", "k", "v", "a", "b", "scale", "initial_state", "output_final_state",
+        "cu_seqlens", "state_indices", "mode", "decay_bias", "elapsed_t", "validated_metadata",
     ),
-    "rwkv7_reference": (
-        "r", "log_decay", "k", "v", "a", "b", "scale", "initial_state", "output_final_state", "cu_seqlens",
-        "state_indices",
-    ),
-    "statetune_recurrent_fp32io16_forward": (
-        "r", "log_decay", "k", "v", "a", "b", "scale", "initial_state", "output_final_state",
+    "rwkv7_recurrent_stateful_from_decay_logits": (
+        "r", "decay_logits", "k", "v", "a", "b", "state_pool", "cu_seqlens", "state_indices", "scale",
+        "mode", "decay_bias", "elapsed_t", "validated_metadata",
     ),
 }
+
+
+def _require_pinned_provider(provider):
+    missing = [
+        name
+        for name in flash_backend.FLASH_RWKV_REQUIRED_OPERATORS
+        if not hasattr(provider, name)
+    ]
+    if missing:
+        pytest.skip(f"installed FlashRWKV predates pinned raw API: {', '.join(missing)}")
 
 
 def test_complete_flash_rwkv_operator_suite_is_public_through_fla():
@@ -108,7 +95,11 @@ def test_every_public_flash_rwkv_operator_routes_to_its_exact_provider_entrypoin
 
     monkeypatch.setattr(flash_api, "_invoke", invoke)
 
-    for name in flash_backend.FLASH_RWKV_PUBLIC_OPERATORS:
+    for name, provider_name in zip(
+        flash_backend.FLASH_RWKV_PUBLIC_OPERATORS,
+        flash_backend.FLASH_RWKV_REQUIRED_OPERATORS,
+        strict=True,
+    ):
         operator = getattr(flash_api, name)
         args = []
         kwargs = {}
@@ -120,16 +111,18 @@ def test_every_public_flash_rwkv_operator_routes_to_its_exact_provider_entrypoin
             else:
                 args.append(object())
         assert operator(*args, **kwargs) is result
-        assert calls[-1][0] == name
+        assert calls[-1][0] == provider_name
 
-    assert [call[0] for call in calls] == list(flash_backend.FLASH_RWKV_PUBLIC_OPERATORS)
+    assert [call[0] for call in calls] == list(flash_backend.FLASH_RWKV_REQUIRED_OPERATORS)
 
 
 def test_provider_namespace_preflights_then_records_exact_operator(monkeypatch):
     calls = []
     expected = object()
     provider = SimpleNamespace(
-        decay_logits_to_log_decay=lambda value: calls.append(("provider", value)) or expected
+        pretrain_tmix_a_gate_bf16=lambda a0, a12: (
+            calls.append(("provider", a0, a12)) or expected
+        )
     )
     monkeypatch.setattr(flash_api, "preflight_flash_rwkv_installation", lambda: calls.append(("preflight",)))
     monkeypatch.setattr(
@@ -138,11 +131,11 @@ def test_provider_namespace_preflights_then_records_exact_operator(monkeypatch):
         lambda name: calls.append(("import", name)) or provider,
     )
 
-    value = object()
-    assert flash_api.decay_logits_to_log_decay(value) is expected
-    assert calls == [("preflight",), ("import", "flash_rwkv"), ("provider", value)]
+    a0, a12 = object(), object()
+    assert flash_api.pretrain_tmix_a_gate_bf16(a0, a12) is expected
+    assert calls == [("preflight",), ("import", "flash_rwkv"), ("provider", a0, a12)]
     assert get_last_rwkv7_provider() == "flash_rwkv"
-    assert get_last_rwkv7_kernel() == "decay_logits_to_log_decay"
+    assert get_last_rwkv7_kernel() == "pretrain_tmix_a_gate_bf16"
 
 
 def test_provider_namespace_fails_closed_before_import(monkeypatch):
@@ -160,10 +153,27 @@ def test_provider_namespace_fails_closed_before_import(monkeypatch):
     )
 
     with pytest.raises(flash_backend.FlashRWKVProvenanceError, match="wrong revision"):
-        flash_api.decay_logits_to_log_decay(object())
+        flash_api.pretrain_tmix_a_gate_bf16(object(), object())
 
     assert get_last_rwkv7_provider() is None
     assert get_last_rwkv7_kernel() is None
+
+
+def test_public_rwkv7_namespaces_expose_no_canonical_log_decay_contract():
+    forbidden = {
+        "chunk_rwkv7_from_log_decay",
+        "decay_logits_to_log_decay",
+        "fused_mul_recurrent_rwkv7_from_log_decay",
+        "fused_recurrent_rwkv7_from_log_decay",
+        "recurrent_rwkv7_from_log_decay",
+        "rwkv7_from_log_decay",
+        "rwkv7_recurrent_from_log_decay",
+        "rwkv7_recurrent_stateful_from_log_decay",
+    }
+
+    assert forbidden.isdisjoint(vars(fla.ops.rwkv7))
+    assert forbidden.isdisjoint(vars(flash_api))
+    assert all("log_decay" not in name for name in flash_api.__all__)
 
 
 def test_standard_attention_inference_routes_all_compatible_fused_blocks(monkeypatch):
@@ -286,9 +296,12 @@ def test_flash_inference_eligibility_excludes_packed_and_training_paths(monkeypa
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_real_provider_standard_attention_inference_matches_unfused_path(monkeypatch):
+    import flash_rwkv
+
     import fla.layers.rwkv7 as layer_module
     from fla.ops.rwkv7.inference import can_use_flash_rwkv_inference
 
+    _require_pinned_provider(flash_rwkv)
     torch.manual_seed(2611)
     layer = layer_module.RWKV7Attention(
         hidden_size=128,
@@ -340,9 +353,12 @@ def test_real_provider_standard_attention_inference_matches_unfused_path(monkeyp
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_real_provider_standard_feed_forward_inference_matches_unfused_path(monkeypatch):
+    import flash_rwkv
+
     import fla.models.rwkv7.modeling_rwkv7 as model_module
     from fla.ops.rwkv7.inference import can_use_flash_rwkv_inference
 
+    _require_pinned_provider(flash_rwkv)
     torch.manual_seed(2612)
     feed_forward = model_module.RWKV7FeedForward(
         hidden_size=128,

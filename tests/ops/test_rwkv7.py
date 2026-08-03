@@ -101,7 +101,7 @@ def test_fused_mul_recurrent_fwd(
     r = torch.empty(B, T, H, D, device=device).uniform_(-8, -6).to(dtype=dtype)
     k = torch.empty(B, T, H, D, device=device).uniform_(-8, -6).to(dtype=dtype)
     v = torch.empty(B, T, H, D, device=device).uniform_(-8, -6).to(dtype=dtype)
-    w = torch.empty(B, T, H, D, device=device).uniform_(-8, -6).to(dtype=dtype)
+    decay_logits = torch.empty(B, T, H, D, device=device).uniform_(-8, -6).to(dtype=dtype)
 
     kk = torch.empty(B, T, H, D, device=device).uniform_(-1, 1)
     kk = F.normalize(kk, dim=-1).to(dtype=dtype)
@@ -110,15 +110,18 @@ def test_fused_mul_recurrent_fwd(
     a_scale = torch.empty(B, T, H, D, device=device).uniform_(0, 0.1).to(dtype=dtype)
     b = (kk * a_scale).requires_grad_(False)  # kk*a
     h0 = torch.randn(B, H, D, D, dtype=torch.float)
-    r, k, v, a, a_scale, b, w, h0 = map(lambda x: x.to(device).requires_grad_(False),
-                                        (r, k, v, a, a_scale, b, w, h0))
+    r, k, v, a, a_scale, b, decay_logits, h0 = map(
+        lambda x: x.to(device).requires_grad_(False),
+        (r, k, v, a, a_scale, b, decay_logits, h0),
+    )
+    log_decay = -0.6065306597126334 * decay_logits.float().sigmoid()
     ref, ref_ht = fused_recurrent_dplr_delta_rule(
         q=r.clone(),
         k=k.clone(),
         v=v.clone(),
         a=a.clone(),
         b=b.clone(),
-        gk=w.clone(),
+        gk=log_decay,
         scale=scale,
         initial_state=h0.clone(),
         output_final_state=True,
@@ -126,7 +129,7 @@ def test_fused_mul_recurrent_fwd(
 
     tri, tri_ht = fused_mul_recurrent_rwkv7(
         r=r.clone(),
-        w=w.clone(),
+        decay_logits=decay_logits.clone(),
         k=k.clone(),
         v=v.clone(),
         kk=kk.clone(),
@@ -145,7 +148,8 @@ def test_chunk_wrapper_chunk_size(chunk_size: int):
     r = torch.empty(B, T, H, D).uniform_(-8, -6).to(device)
     k = torch.empty(B, T, H, D).uniform_(-8, -6).to(device)
     v = torch.empty(B, T, H, D).uniform_(-8, -6).to(device)
-    w = torch.empty(B, T, H, D).uniform_(-8, -6).to(device)
+    decay_logits = torch.randn(B, T, H, D, device=device)
+    decay_bias = torch.randn(H, D, device=device)
     kk = F.normalize(torch.empty(B, T, H, D).uniform_(-1, 1), dim=-1).to(device)
     a = -kk
     b = kk * torch.empty(B, T, H, D).uniform_(0, 0.1).to(device)
@@ -156,24 +160,85 @@ def test_chunk_wrapper_chunk_size(chunk_size: int):
         v=v.clone(),
         a=a.clone(),
         b=b.clone(),
-        gk=w.clone(),
+        gk=-0.6065306597126334 * (decay_logits + decay_bias).sigmoid(),
         scale=1.0,
         output_final_state=True,
         chunk_size=chunk_size,
     )
     actual, actual_state = chunk_rwkv7(
         r=r.clone(),
-        w=w.clone(),
+        decay_logits=decay_logits.clone(),
         k=k.clone(),
         v=v.clone(),
         a=a.clone(),
         b=b.clone(),
         output_final_state=True,
         chunk_size=chunk_size,
+        decay_bias=decay_bias,
     )
 
     assert_close('o', expected, actual, 0.002)
     assert_close('ht', expected_state, actual_state, 0.002)
+
+
+def test_chunk_raw_decay_bias_backward_matches_independent_transform():
+    B, T, H, D = 1, 16, 1, 64
+    dtype = torch.bfloat16
+    torch.manual_seed(43)
+    operands = [
+        (torch.randn(B, T, H, D, device=device, dtype=dtype) * 0.05).requires_grad_()
+        for _ in range(5)
+    ]
+    r, k, v, a, b = operands
+    decay_logits = torch.randn(B, T, H, D, device=device, dtype=dtype).requires_grad_()
+    decay_bias = torch.randn(H, D, device=device, dtype=dtype).requires_grad_()
+
+    reference_operands = [value.detach().clone().requires_grad_() for value in operands]
+    reference_logits = decay_logits.detach().clone().requires_grad_()
+    reference_bias = decay_bias.detach().clone().requires_grad_()
+    log_decay = -0.6065306597126334 * (
+        reference_logits.float() + reference_bias.float()
+    ).sigmoid()
+    expected, expected_state = chunk_dplr_delta_rule(
+        q=reference_operands[0],
+        k=reference_operands[1],
+        v=reference_operands[2],
+        a=reference_operands[3],
+        b=reference_operands[4],
+        gk=log_decay,
+        scale=1.0,
+        output_final_state=True,
+        safe_gate=True,
+        chunk_size=16,
+    )
+    (expected.float().square().mean() + expected_state.square().mean()).backward()
+
+    actual, actual_state = chunk_rwkv7(
+        r=r,
+        decay_logits=decay_logits,
+        k=k,
+        v=v,
+        a=a,
+        b=b,
+        scale=1.0,
+        output_final_state=True,
+        safe_gate=True,
+        chunk_size=16,
+        decay_bias=decay_bias,
+    )
+    (actual.float().square().mean() + actual_state.square().mean()).backward()
+
+    assert_close('o', expected, actual, 0.003)
+    assert_close('ht', expected_state, actual_state, 0.003)
+    for name, reference, fused in zip(
+        ('dr', 'dk', 'dv', 'da', 'db'),
+        reference_operands,
+        operands,
+        strict=True,
+    ):
+        assert_close(name, reference.grad, fused.grad, 0.008)
+    assert_close('d_decay_logits', reference_logits.grad, decay_logits.grad, 0.008)
+    assert_close('d_decay_bias', reference_bias.grad, decay_bias.grad, 0.008)
 
 
 @pytest.mark.parametrize("B", [1])

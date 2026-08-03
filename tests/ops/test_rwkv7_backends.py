@@ -20,7 +20,13 @@ import torch
 
 from benchmarks.ops.benchmark_rwkv7_flash_provider import _format_result
 from benchmarks.ops.registry import get_op
-from fla.ops.rwkv7 import chunk_rwkv7, get_last_rwkv7_provider, recurrent_rwkv7
+from fla.ops.rwkv7 import (
+    chunk_rwkv7,
+    get_last_rwkv7_kernel,
+    get_last_rwkv7_provider,
+    prepare_rwkv7_recurrent_metadata,
+    recurrent_rwkv7,
+)
 from fla.ops.rwkv7.backends import flash_rwkv as flash_rwkv_backend
 from fla.ops.rwkv7.backends.flash_rwkv import (
     FLASH_RWKV_SOURCE_REVISION,
@@ -41,7 +47,7 @@ def _tensor(
     contiguous=True,
 ):
     shape = shape or (1, 32, 2, size)
-    return SimpleNamespace(
+    tensor = SimpleNamespace(
         dtype=dtype,
         shape=shape,
         ndim=len(shape),
@@ -51,10 +57,15 @@ def _tensor(
         is_contiguous=lambda: contiguous,
         is_floating_point=lambda: dtype.is_floating_point,
     )
+    tensor.numel = lambda: torch.Size(shape).numel()
+    return tensor
 
 
 def _call_args(**overrides):
-    args = {name: _tensor() for name in ("r", "w", "k", "v", "a", "b")}
+    args = {
+        name: _tensor()
+        for name in ("r", "decay_logits", "k", "v", "a", "b")
+    }
     args.update(overrides)
     return args
 
@@ -66,8 +77,36 @@ def _metadata(values, *, dtype=torch.int32, device="cuda:0", contiguous=True):
         shape=(len(values),),
         ndim=1,
         device=torch.device(device),
+        is_cuda=torch.device(device).type == "cuda",
         is_contiguous=lambda: contiguous,
     )
+
+
+@pytest.fixture(autouse=True)
+def _clear_flash_rwkv_provider_cache():
+    flash_rwkv_backend._load_flash_rwkv_provider.cache_clear()
+    yield
+    flash_rwkv_backend._load_flash_rwkv_provider.cache_clear()
+
+
+def _admit_fake_provider(monkeypatch, provider):
+    monkeypatch.setitem(sys.modules, "flash_rwkv", provider)
+    monkeypatch.setattr(
+        flash_rwkv_backend,
+        "_flash_rwkv_preflight_result",
+        object(),
+    )
+    flash_rwkv_backend._load_flash_rwkv_provider.cache_clear()
+
+
+def _require_pinned_provider(provider):
+    missing = [
+        name
+        for name in flash_rwkv_backend.FLASH_RWKV_REQUIRED_OPERATORS
+        if not hasattr(provider, name)
+    ]
+    if missing:
+        pytest.skip(f"installed FlashRWKV predates pinned raw API: {', '.join(missing)}")
 
 
 def test_flash_rwkv_backend_is_enabled_by_default(monkeypatch):
@@ -79,14 +118,23 @@ def test_flash_rwkv_backend_is_enabled_by_default(monkeypatch):
 
 
 def test_public_stateful_signature_matches_vllm_consumer_contract():
-    required = {"initial_state", "output_final_state", "cu_seqlens", "state_indices", "mode"}
+    required = {
+        "initial_state",
+        "output_final_state",
+        "cu_seqlens",
+        "state_indices",
+        "mode",
+        "decay_bias",
+        "elapsed_t",
+        "validated_metadata",
+    }
 
     assert required <= inspect.signature(recurrent_rwkv7).parameters.keys()
     assert required <= inspect.signature(FlashRWKVBackend.recurrent_rwkv7).parameters.keys()
     assert required <= inspect.signature(FlashRWKVBackend.recurrent_rwkv7_verifier).parameters.keys()
     assert tuple(inspect.signature(recurrent_rwkv7).parameters) == (
         "r",
-        "w",
+        "decay_logits",
         "k",
         "v",
         "a",
@@ -102,7 +150,16 @@ def test_public_stateful_signature_matches_vllm_consumer_contract():
         "chunk_size",
         "disable_recompute",
         "cp_context",
+        "decay_bias",
+        "elapsed_t",
+        "validated_metadata",
         "kwargs",
+    )
+    assert tuple(inspect.signature(prepare_rwkv7_recurrent_metadata).parameters) == (
+        "cu_seqlens",
+        "state_indices",
+        "total_tokens",
+        "state_pool_size",
     )
 
 
@@ -114,7 +171,7 @@ def test_public_chunk_api_and_benchmark_registry_identity_are_preserved():
     assert fla.ops.rwkv7.chunk_rwkv7 is chunk_rwkv7
     assert tuple(inspect.signature(chunk_rwkv7).parameters) == (
         "r",
-        "w",
+        "decay_logits",
         "k",
         "v",
         "a",
@@ -128,6 +185,7 @@ def test_public_chunk_api_and_benchmark_registry_identity_are_preserved():
         "chunk_size",
         "disable_recompute",
         "cp_context",
+        "decay_bias",
         "kwargs",
     )
     benchmark = get_op("chunk_rwkv7")
@@ -158,12 +216,13 @@ def test_public_contract_owns_only_exact_recurrent_provider():
     assert fla.ops.rwkv7.chunk_rwkv7 is chunk_rwkv7
     assert not hasattr(fla.ops, "chunk_rwkv7_reference")
     assert not hasattr(fla.ops.rwkv7, "chunk_rwkv7_reference")
-    assert 'algorithm="recurrent"' in implementation
+    assert 'kernel = "rwkv7_recurrent"' in implementation
     assert "chunk_rwkv7_reference" not in implementation
     assert "chunk_dplr_delta_rule" not in implementation
     assert "pretrain_recurrent_fp32io16_forward" in implementation
     assert "rwkv7_recurrent_stateful" in implementation
-    assert "FlashRWKVBackend" not in fallback
+    assert "dict(" not in fallback
+    assert "recurrent_rwkv7_verifier" not in fallback
     assert "if mode == 'recurrent':" in layer
     assert "return recurrent_rwkv7(" in layer
 
@@ -227,7 +286,8 @@ def test_rwkv7_layer_explicit_mode_selects_exact_operator(monkeypatch, mode, sel
     actual = layer._run_rwkv7_operator(
         mode,
         r=tensor,
-        w=tensor,
+        decay_logits=tensor,
+        decay_bias=None,
         k=tensor,
         v=tensor,
         kk=tensor,
@@ -325,6 +385,16 @@ def test_rwkv7_layer_rejects_unknown_explicit_mode():
         ({}, {"cp_context": object()}, "FlashRWKV recurrent API does not support context parallel execution"),
         ({}, {"disable_recompute": True}, "FlashRWKV recurrent API does not support disable_recompute=True"),
         ({}, {"chunk_size": 8}, "FlashRWKV recurrent API does not accept chunk_size"),
+        (
+            {},
+            {"validated_metadata": object()},
+            "FlashRWKV validated_metadata requires packed stateful metadata",
+        ),
+        (
+            {"r": _tensor(requires_grad=True)},
+            {"validated_metadata": object()},
+            "FlashRWKV training does not accept validated packed metadata",
+        ),
     ],
 )
 def test_flash_rwkv_verifier_rejection_decision_table(overrides, kwargs, reason):
@@ -354,7 +424,10 @@ def test_flash_rwkv_verifier_accepts_supported_execution(requires_grad, packed):
 
 @pytest.mark.parametrize("head_size", [128, 256])
 def test_flash_rwkv_verifier_accepts_large_recurrent_heads(head_size):
-    inputs = {name: _tensor(size=head_size) for name in ("r", "w", "k", "v", "a", "b")}
+    inputs = {
+        name: _tensor(size=head_size)
+        for name in ("r", "decay_logits", "k", "v", "a", "b")
+    }
     accepted, reason = FlashRWKVBackend().recurrent_rwkv7_verifier(
         **inputs,
         initial_state=_tensor(
@@ -451,7 +524,7 @@ def test_flash_rwkv_verifier_rejects_invalid_state_pool_slots(
     accepted, actual_reason = FlashRWKVBackend().recurrent_rwkv7_verifier(
         **{
             name: _tensor(shape=(1, 3, 2, 64))
-            for name in ("r", "w", "k", "v", "a", "b")
+            for name in ("r", "decay_logits", "k", "v", "a", "b")
         },
         cu_seqlens=_metadata((0, 2, 3)),
         state_indices=state_indices,
@@ -469,13 +542,14 @@ def test_flash_rwkv_verifier_accepts_mixed_wave_noncontiguous_slots(mode, state_
     accepted, reason = FlashRWKVBackend().recurrent_rwkv7_verifier(
         **{
             name: _tensor(shape=(1, 3, 2, 64))
-            for name in ("r", "w", "k", "v", "a", "b")
+            for name in ("r", "decay_logits", "k", "v", "a", "b")
         },
         cu_seqlens=_metadata((0, 2, 3)),
         state_indices=_metadata((3, 1)),
         initial_state=_tensor(dtype=state_dtype, shape=(4, 2, 64, 64)),
         output_final_state=True,
         mode=mode,
+        validated_metadata=object(),
     )
 
     assert accepted is True
@@ -486,7 +560,9 @@ def test_recurrent_dispatch_validates_public_provenance_once(monkeypatch):
     validation_calls = []
     provider_calls = []
     fake_provider = SimpleNamespace(
-        rwkv7=lambda *args, **kwargs: provider_calls.append((args, kwargs)) or ("output", "state")
+        rwkv7_recurrent=lambda *args, **kwargs: (
+            provider_calls.append((args, kwargs)) or ("output", "state")
+        )
     )
 
     monkeypatch.setattr(
@@ -500,6 +576,7 @@ def test_recurrent_dispatch_validates_public_provenance_once(monkeypatch):
         lambda: validation_calls.append(True) or object(),
     )
     monkeypatch.setitem(sys.modules, "flash_rwkv", fake_provider)
+    flash_rwkv_backend._load_flash_rwkv_provider.cache_clear()
     monkeypatch.setenv("FLA_FLASH_RWKV", "1")
 
     for _ in range(5):
@@ -679,20 +756,27 @@ native_root.mkdir(parents=True, exist_ok=True)
 native_path = native_root / f"_C{importlib.machinery.EXTENSION_SUFFIXES[0]}"
 native_path.write_bytes(b"native-placeholder")
 
-def rwkv7(
-    r, log_decay, k, v, a, b, *, scale, initial_state,
-    output_final_state, cu_seqlens, mode, algorithm, chunk_size,
+def rwkv7_recurrent(
+    r, decay_logits, k, v, a, b, *, scale, initial_state,
+    output_final_state, cu_seqlens, state_indices, mode, decay_bias, elapsed_t,
+    validated_metadata,
 ):
     pass
 
 def rwkv7_recurrent_stateful(
-    r, log_decay, k, v, a, b, *, state_pool, cu_seqlens,
-    state_indices, scale, mode,
+    r, decay_logits, k, v, a, b, *, state_pool, cu_seqlens,
+    state_indices, scale, mode, decay_bias, elapsed_t, validated_metadata,
 ):
     pass
 
 def pretrain_recurrent_fp32io16_forward(
-    r, log_decay, k, v, a, b, *, scale, initial_state, output_final_state,
+    r, decay_logits, k, v, a, b, *, scale, initial_state,
+    output_final_state, decay_bias, elapsed_t,
+):
+    pass
+
+def prepare_recurrent_metadata(
+    cu_seqlens, state_indices, *, total_tokens, state_pool_size,
 ):
     pass
 
@@ -701,12 +785,13 @@ module = SimpleNamespace(
     __file__=str(module_path),
     __version__="0.1.0",
     _C=native,
-    rwkv7=rwkv7,
+    rwkv7_recurrent=rwkv7_recurrent,
     rwkv7_recurrent_stateful=rwkv7_recurrent_stateful,
     pretrain_recurrent_fp32io16_forward=pretrain_recurrent_fp32io16_forward,
+    prepare_recurrent_metadata=prepare_recurrent_metadata,
     validate_packed_metadata_strict=lambda *args, **kwargs: None,
 )
-for operator in backend.FLASH_RWKV_PUBLIC_OPERATORS:
+for operator in backend.FLASH_RWKV_REQUIRED_OPERATORS:
     if not hasattr(module, operator):
         setattr(module, operator, lambda *args, **kwargs: None)
 direct_url = (
@@ -853,7 +938,8 @@ def test_gpu_gate_validates_complete_result_contract():
         "flash_rwkv_source_revision": FLASH_RWKV_SOURCE_REVISION,
         "backend": "flash_rwkv",
         "selected_provider": "flash_rwkv",
-        "oracle": "explicit-pytorch-sequential-recurrent-autograd",
+        "selected_kernel": "pretrain_recurrent_fp32io16_forward",
+        "oracle": "independent-raw-decay-transform-plus-pytorch-sequential-recurrence-autograd",
         "dtype": "float16",
         "label": "flash-rwkv-float16-B2T4",
         "B": 2,
@@ -969,8 +1055,12 @@ assert type(AutoConfig.for_model("rwkv7")) is native_config
 def test_recurrent_rwkv7_dispatches_to_flash_provider(monkeypatch):
     calls = []
     expected = ("flash-output", "flash-state")
-    fake_provider = SimpleNamespace(rwkv7=lambda *args, **kwargs: calls.append((args, kwargs)) or expected)
-    monkeypatch.setitem(sys.modules, "flash_rwkv", fake_provider)
+    fake_provider = SimpleNamespace(
+        rwkv7_recurrent=lambda *args, **kwargs: (
+            calls.append((args, kwargs)) or expected
+        )
+    )
+    _admit_fake_provider(monkeypatch, fake_provider)
     monkeypatch.setenv("FLA_FLASH_RWKV", "1")
     monkeypatch.setattr(FlashRWKVBackend, "is_available", classmethod(lambda cls: True))
 
@@ -978,17 +1068,47 @@ def test_recurrent_rwkv7_dispatches_to_flash_provider(monkeypatch):
 
     assert actual == expected
     assert get_last_rwkv7_provider() == "flash_rwkv"
-    assert calls[0][1]["algorithm"] == "recurrent"
     assert calls[0][1]["mode"] == "fp32io16"
+    assert calls[0][1]["decay_bias"] is None
+    assert calls[0][1]["elapsed_t"] is None
+    assert calls[0][1]["validated_metadata"] is None
+    assert get_last_rwkv7_kernel() == "rwkv7_recurrent"
+
+
+def test_prepare_rwkv7_recurrent_metadata_is_an_opaque_thin_provider_boundary(monkeypatch):
+    calls = []
+    ticket = object()
+    cu_seqlens = object()
+    state_indices = object()
+    fake_provider = SimpleNamespace(
+        prepare_recurrent_metadata=lambda *args, **kwargs: (
+            calls.append((args, kwargs)) or ticket
+        )
+    )
+    _admit_fake_provider(monkeypatch, fake_provider)
+
+    actual = prepare_rwkv7_recurrent_metadata(
+        cu_seqlens,
+        state_indices,
+        total_tokens=17,
+        state_pool_size=23,
+    )
+
+    assert actual is ticket
+    assert calls == [
+        ((cu_seqlens, state_indices), {"total_tokens": 17, "state_pool_size": 23})
+    ]
 
 
 def test_recurrent_rwkv7_dispatches_gradients_to_exact_recurrent_autograd(monkeypatch):
     calls = []
     expected = ("training-output", "training-state")
     fake_provider = SimpleNamespace(
-        pretrain_recurrent_fp32io16_forward=lambda *args, **kwargs: calls.append((args, kwargs)) or expected
+        pretrain_recurrent_fp32io16_forward=lambda *args, **kwargs: (
+            calls.append((args, kwargs)) or expected
+        )
     )
-    monkeypatch.setitem(sys.modules, "flash_rwkv", fake_provider)
+    _admit_fake_provider(monkeypatch, fake_provider)
     monkeypatch.setenv("FLA_FLASH_RWKV", "1")
     monkeypatch.setattr(FlashRWKVBackend, "is_available", classmethod(lambda cls: True))
 
@@ -1052,20 +1172,23 @@ def test_public_recurrent_rwkv7_runs_mixed_wave_in_place_without_fallback(
     state_pool.updated_slots = None
     cu_seqlens = _metadata((0, 2, 3))
     state_indices = _metadata((3, 1))
+    validated_metadata = object()
 
     def rwkv7_recurrent_stateful(*args, **kwargs):
         calls.append((args, kwargs))
         kwargs["state_pool"].updated_slots = kwargs["state_indices"].values
         return "mixed-wave-output"
 
-    fake_provider = SimpleNamespace(rwkv7_recurrent_stateful=rwkv7_recurrent_stateful)
-    monkeypatch.setitem(sys.modules, "flash_rwkv", fake_provider)
+    fake_provider = SimpleNamespace(
+        rwkv7_recurrent_stateful=rwkv7_recurrent_stateful
+    )
+    _admit_fake_provider(monkeypatch, fake_provider)
     monkeypatch.delenv("FLA_FLASH_RWKV", raising=False)
     monkeypatch.setattr(FlashRWKVBackend, "is_available", classmethod(lambda cls: True))
 
     inputs = {
         name: _tensor(shape=(1, 3, 2, 64))
-        for name in ("r", "w", "k", "v", "a", "b")
+        for name in ("r", "decay_logits", "k", "v", "a", "b")
     }
     output, final_state = recurrent_rwkv7(
         **inputs,
@@ -1074,6 +1197,7 @@ def test_public_recurrent_rwkv7_runs_mixed_wave_in_place_without_fallback(
         cu_seqlens=cu_seqlens,
         state_indices=state_indices,
         mode=mode,
+        validated_metadata=validated_metadata,
     )
 
     assert output == "mixed-wave-output"
@@ -1086,15 +1210,16 @@ def test_public_recurrent_rwkv7_runs_mixed_wave_in_place_without_fallback(
     assert kwargs["cu_seqlens"] is cu_seqlens
     assert kwargs["state_indices"] is state_indices
     assert kwargs["mode"] == mode
+    assert kwargs["validated_metadata"] is validated_metadata
+    assert get_last_rwkv7_kernel() == "rwkv7_recurrent_stateful"
 
 
 def test_public_stateful_provider_failure_clears_telemetry(monkeypatch):
     def fail(*args, **kwargs):
         raise RuntimeError("stateful provider failed")
 
-    monkeypatch.setitem(
-        sys.modules,
-        "flash_rwkv",
+    _admit_fake_provider(
+        monkeypatch,
         SimpleNamespace(rwkv7_recurrent_stateful=fail),
     )
     monkeypatch.delenv("FLA_FLASH_RWKV", raising=False)
@@ -1106,7 +1231,7 @@ def test_public_stateful_provider_failure_clears_telemetry(monkeypatch):
         recurrent_rwkv7(
             **{
                 name: _tensor(shape=(1, 3, 2, 64))
-                for name in ("r", "w", "k", "v", "a", "b")
+                for name in ("r", "decay_logits", "k", "v", "a", "b")
             },
             initial_state=_tensor(dtype=torch.float32, shape=(4, 2, 64, 64)),
             output_final_state=True,
@@ -1117,20 +1242,21 @@ def test_public_stateful_provider_failure_clears_telemetry(monkeypatch):
     assert get_last_rwkv7_provider() is None
 
 
-def test_explicit_flash_rwkv_unavailable_fails_closed(monkeypatch):
-    monkeypatch.setenv("FLA_FLASH_RWKV", "1")
-    monkeypatch.setattr(FlashRWKVBackend, "is_available", classmethod(lambda cls: False))
+def test_flash_rwkv_provenance_failure_fails_closed(monkeypatch):
+    def unavailable():
+        raise FlashRWKVProvenanceError("provider unavailable")
 
-    with pytest.raises(RuntimeError, match="fallback is disabled"):
+    monkeypatch.setattr(flash_rwkv_backend, "_load_flash_rwkv_provider", unavailable)
+
+    with pytest.raises(RuntimeError, match="provider unavailable.*fallback is disabled"):
         recurrent_rwkv7(**_call_args())
     assert get_last_rwkv7_provider() is None
 
 
 def test_default_flash_rwkv_unavailable_has_no_reference_fallback(monkeypatch):
-    monkeypatch.delenv("FLA_FLASH_RWKV", raising=False)
-    monkeypatch.setattr(FlashRWKVBackend, "is_available", classmethod(lambda cls: False))
+    _admit_fake_provider(monkeypatch, SimpleNamespace())
 
-    with pytest.raises(RuntimeError, match="fallback is disabled"):
+    with pytest.raises(AttributeError, match="rwkv7_recurrent"):
         recurrent_rwkv7(**_call_args())
     assert get_last_rwkv7_provider() is None
 
@@ -1139,8 +1265,8 @@ def test_failed_provider_call_clears_stale_success(monkeypatch):
     def fail(*args, **kwargs):
         raise RuntimeError("provider failed")
 
-    fake_provider = SimpleNamespace(rwkv7=fail)
-    monkeypatch.setitem(sys.modules, "flash_rwkv", fake_provider)
+    fake_provider = SimpleNamespace(rwkv7_recurrent=fail)
+    _admit_fake_provider(monkeypatch, fake_provider)
     monkeypatch.setenv("FLA_FLASH_RWKV", "1")
     monkeypatch.setattr(FlashRWKVBackend, "is_available", classmethod(lambda cls: True))
     set_provider = importlib.import_module("fla.ops.rwkv7.backends.provider").set_last_rwkv7_provider
@@ -1163,6 +1289,7 @@ def test_flash_rwkv_real_provider_matches_torch_training_cell(
     head_size,
 ):
     import flash_rwkv
+    _require_pinned_provider(flash_rwkv)
 
     torch.manual_seed(7)
     dtype = torch.bfloat16
@@ -1254,6 +1381,7 @@ def test_flash_rwkv_real_provider_packed_state_pool_contract(
     head_size,
 ):
     import flash_rwkv
+    _require_pinned_provider(flash_rwkv)
 
     torch.manual_seed(19)
     shape = (1, 3, 1, head_size)
@@ -1294,10 +1422,15 @@ def test_flash_rwkv_real_provider_packed_state_pool_contract(
         observed["state_pool"] = kwargs["state_pool"]
         observed["cu_seqlens"] = kwargs["cu_seqlens"]
         observed["state_indices"] = kwargs["state_indices"]
+        observed["validated_metadata"] = kwargs["validated_metadata"]
         return original(*args, **kwargs)
 
-    monkeypatch.setattr(flash_rwkv, "rwkv7_recurrent_stateful", observe_metadata)
-    flash_rwkv.validate_packed_metadata_strict(
+    monkeypatch.setattr(
+        flash_rwkv,
+        "rwkv7_recurrent_stateful",
+        observe_metadata,
+    )
+    validated_metadata = prepare_rwkv7_recurrent_metadata(
         cu_seqlens,
         state_indices,
         total_tokens=shape[1],
@@ -1310,6 +1443,7 @@ def test_flash_rwkv_real_provider_packed_state_pool_contract(
         cu_seqlens=cu_seqlens,
         state_indices=state_indices,
         mode=mode,
+        validated_metadata=validated_metadata,
     )
     torch.cuda.synchronize()
 
@@ -1318,6 +1452,7 @@ def test_flash_rwkv_real_provider_packed_state_pool_contract(
     assert observed["state_pool"] is state_pool
     assert observed["cu_seqlens"] is cu_seqlens
     assert observed["state_indices"] is state_indices
+    assert observed["validated_metadata"] is validated_metadata
     assert cu_seqlens.data_ptr() == cu_seqlens_pointer
     assert state_indices.data_ptr() == state_indices_pointer
     _assert_relative_rmse(actual_output, expected_output, maximum=0.003)
@@ -1332,9 +1467,15 @@ def test_flash_rwkv_real_provider_packed_state_pool_contract(
     )
 
     graph_pool = initial_pool.clone()
-    warmup_stream = torch.cuda.Stream()
-    warmup_stream.wait_stream(torch.cuda.current_stream())
-    with torch.cuda.stream(warmup_stream):
+    capture_stream = torch.cuda.Stream()
+    capture_stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(capture_stream):
+        graph_metadata = prepare_rwkv7_recurrent_metadata(
+            cu_seqlens,
+            state_indices,
+            total_tokens=shape[1],
+            state_pool_size=graph_pool.shape[0],
+        )
         for _ in range(3):
             recurrent_rwkv7(
                 *inputs,
@@ -1343,10 +1484,11 @@ def test_flash_rwkv_real_provider_packed_state_pool_contract(
                 cu_seqlens=cu_seqlens,
                 state_indices=state_indices,
                 mode=mode,
+                validated_metadata=graph_metadata,
             )
-    torch.cuda.current_stream().wait_stream(warmup_stream)
+    torch.cuda.current_stream().wait_stream(capture_stream)
     graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
+    with torch.cuda.graph(graph, stream=capture_stream):
         captured_output, captured_state = recurrent_rwkv7(
             *inputs,
             initial_state=graph_pool,
@@ -1354,6 +1496,7 @@ def test_flash_rwkv_real_provider_packed_state_pool_contract(
             cu_seqlens=cu_seqlens,
             state_indices=state_indices,
             mode=mode,
+            validated_metadata=graph_metadata,
         )
     graph.replay()
     torch.cuda.synchronize()
@@ -1384,12 +1527,49 @@ def test_flash_rwkv_real_provider_strict_debug_validation_rejects_hostile_metada
         )
 
 
-def _torch_rwkv7(r, w, k, v, a, b, *, initial_state, scale=1.0):
-    state = initial_state.float()
+def _torch_rwkv7(
+    r,
+    decay_logits,
+    k,
+    v,
+    a,
+    b,
+    *,
+    initial_state,
+    scale=1.0,
+    decay_bias=None,
+):
+    if decay_bias is not None:
+        decay_logits = decay_logits + decay_bias
+    log_decay = -0.6065306597126334 * decay_logits.float().sigmoid()
+    return _torch_rwkv7_from_log_decay(
+        r,
+        log_decay,
+        k,
+        v,
+        a,
+        b,
+        initial_state=initial_state,
+        scale=scale,
+    )
+
+
+def _torch_rwkv7_from_log_decay(
+    r,
+    log_decay,
+    k,
+    v,
+    a,
+    b,
+    *,
+    initial_state,
+    scale=1.0,
+):
     outputs = []
+    state = initial_state.float()
     for index in range(r.shape[1]):
         state = (
-            w[:, index].float().exp().unsqueeze(-1) * state
+            log_decay[:, index].exp().unsqueeze(-1) * state
             + b[:, index].float().unsqueeze(-1)
             * torch.einsum("bhk,bhkv->bhv", a[:, index].float(), state).unsqueeze(-2)
             + k[:, index].float().unsqueeze(-1)
@@ -1405,7 +1585,7 @@ def _torch_rwkv7(r, w, k, v, a, b, *, initial_state, scale=1.0):
 
 def _torch_rwkv7_packed(
     r,
-    w,
+    decay_logits,
     k,
     v,
     a,
@@ -1421,7 +1601,7 @@ def _torch_rwkv7_packed(
     for (start, end), slot in zip(sequence_ranges, state_slots, strict=True):
         sequence_output, sequence_state = _torch_rwkv7(
             r[:, start:end],
-            w[:, start:end],
+            decay_logits[:, start:end],
             k[:, start:end],
             v[:, start:end],
             a[:, start:end],

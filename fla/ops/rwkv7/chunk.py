@@ -11,9 +11,53 @@ from fla.ops.cp import FLACPContext
 from fla.ops.generalized_delta_rule import chunk_dplr_delta_rule
 
 
+def _chunk_rwkv7(
+    r: torch.Tensor,
+    decay: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    scale: float,
+    initial_state: torch.Tensor | None,
+    output_final_state: bool,
+    cu_seqlens: torch.LongTensor | None,
+    cu_seqlens_cpu: torch.LongTensor | None,
+    safe_gate: bool,
+    chunk_size: int | None,
+    disable_recompute: bool,
+    cp_context: FLACPContext | None,
+    decay_bias: torch.Tensor | None,
+    **kwargs,
+):
+    if 'head_first' in kwargs:
+        raise DeprecationWarning(
+            "head_first has been removed. Inputs must be in `[B, T, H, ...]` format.",
+        )
+    return chunk_dplr_delta_rule(
+        q=r,
+        k=k,
+        v=v,
+        a=a,
+        b=b,
+        gk=decay,
+        scale=scale,
+        initial_state=initial_state,
+        output_final_state=output_final_state,
+        cu_seqlens=cu_seqlens,
+        cu_seqlens_cpu=cu_seqlens_cpu,
+        safe_gate=safe_gate,
+        chunk_size=chunk_size,
+        disable_recompute=disable_recompute,
+        cp_context=cp_context,
+        _rwkv7_decay_logits=True,
+        _rwkv7_decay_bias=decay_bias,
+    )
+
+
 def chunk_rwkv7(
     r: torch.Tensor,
-    w: torch.Tensor,
+    decay_logits: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
     a: torch.Tensor,
@@ -27,14 +71,16 @@ def chunk_rwkv7(
     chunk_size: int | None = None,
     disable_recompute: bool = False,
     cp_context: FLACPContext | None = None,
+    decay_bias: torch.Tensor | None = None,
     **kwargs,
 ):
     """
     Args:
         r (torch.Tensor):
             r of shape `[B, T, H, K]`.
-        w (torch.Tensor):
-            log decay of shape `[B, T, H, K]`.
+        decay_logits (torch.Tensor):
+            Raw checkpoint decay logits of shape `[B, T, H, K]`. The kernel
+            fuses `-exp(-0.5) * sigmoid(decay_logits)` into its cumsum pass.
         k (torch.Tensor):
             k of shape `[B, T, H, K]`.
         v (torch.Tensor):
@@ -69,17 +115,13 @@ def chunk_rwkv7(
             When provided, `initial_state` and `output_final_state` are not supported,
             and `cp_context.cu_seqlens` is used as the local `cu_seqlens`. Default: `None`.
     """
-    if 'head_first' in kwargs:
-        raise DeprecationWarning(
-            "head_first has been removed. Inputs must be in `[B, T, H, ...]` format.",
-        )
-    return chunk_dplr_delta_rule(
-        q=r,
+    return _chunk_rwkv7(
+        r=r,
+        decay=decay_logits,
         k=k,
         v=v,
         a=a,
         b=b,
-        gk=w,
         scale=scale,
         initial_state=initial_state,
         output_final_state=output_final_state,
@@ -89,4 +131,6 @@ def chunk_rwkv7(
         chunk_size=chunk_size,
         disable_recompute=disable_recompute,
         cp_context=cp_context,
+        decay_bias=decay_bias,
+        **kwargs,
     )
