@@ -58,15 +58,7 @@ FLASH_RWKV_REQUIRED_OPERATORS = (
     "rwkv7_recurrent",
     "rwkv7_recurrent_stateful",
 )
-FLASH_RWKV_PUBLIC_OPERATORS = tuple(
-    {
-        "pretrain_recurrent_fp32io16_forward": "pretrain_recurrent_fp32io16_from_decay_logits",
-        "rwkv7": "rwkv7_from_decay_logits",
-        "rwkv7_recurrent": "rwkv7_recurrent_from_decay_logits",
-        "rwkv7_recurrent_stateful": "rwkv7_recurrent_stateful_from_decay_logits",
-    }.get(name, name)
-    for name in FLASH_RWKV_REQUIRED_OPERATORS
-)
+FLASH_RWKV_PUBLIC_OPERATORS = FLASH_RWKV_REQUIRED_OPERATORS
 
 
 class FlashRWKVProvenanceError(RuntimeError):

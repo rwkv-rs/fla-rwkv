@@ -48,7 +48,7 @@ def _invoke(operator: str, *args, **kwargs) -> Any:
     return result
 
 
-def pretrain_recurrent_fp32io16_from_decay_logits(
+def pretrain_recurrent_fp32io16_forward(
     r: torch.Tensor,
     decay_logits: torch.Tensor,
     k: torch.Tensor,
@@ -78,7 +78,7 @@ def pretrain_recurrent_fp32io16_from_decay_logits(
     )
 
 
-def rwkv7_recurrent_from_decay_logits(
+def rwkv7_recurrent(
     r: torch.Tensor,
     decay_logits: torch.Tensor,
     k: torch.Tensor,
@@ -116,7 +116,7 @@ def rwkv7_recurrent_from_decay_logits(
     )
 
 
-def rwkv7_recurrent_stateful_from_decay_logits(
+def rwkv7_recurrent_stateful(
     r: torch.Tensor,
     decay_logits: torch.Tensor,
     k: torch.Tensor,
@@ -168,7 +168,7 @@ def prepare_recurrent_metadata(
     )
 
 
-def rwkv7_from_decay_logits(
+def rwkv7(
     r: torch.Tensor,
     decay_logits: torch.Tensor,
     k: torch.Tensor,
@@ -182,7 +182,7 @@ def rwkv7_from_decay_logits(
     cu_seqlens: torch.Tensor | None = None,
     state_indices: torch.Tensor | None = None,
     mode: str = "fp32io16",
-    algorithm: str = "reference",
+    algorithm: str = "auto",
     chunk_size: int | None = None,
     chunk_config: ChunkConfig | None = None,
     decay_bias: torch.Tensor | None = None,
