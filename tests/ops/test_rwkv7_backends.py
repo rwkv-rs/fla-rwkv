@@ -406,6 +406,7 @@ def test_rwkv7_layer_train_under_no_grad_uses_split_decay_bias_hot_path(monkeypa
     assert captured["mode"] == "recurrent"
     assert captured["decay_bias"] is not None
     assert captured["decay_bias"].data_ptr() == layer.w_lora.lora[2].bias.data_ptr()
+    assert not captured["decay_bias"].requires_grad
     assert captured["decay_logits"].grad_fn is None
     assert torch.isfinite(output).all()
 
