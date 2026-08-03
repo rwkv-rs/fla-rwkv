@@ -18,7 +18,7 @@ from pathlib import Path
 
 import torch
 
-from fla.ops.rwkv7 import get_last_rwkv7_provider, recurrent_rwkv7
+from fla.ops.rwkv7 import get_last_rwkv7_kernel, get_last_rwkv7_provider, recurrent_rwkv7
 from fla.ops.rwkv7.backends.flash_rwkv import validate_flash_rwkv_installation
 from fla.utils import device
 
@@ -84,7 +84,7 @@ def _run_provider(inputs: list[torch.Tensor], state: torch.Tensor):
         initial_state=state,
         output_final_state=True,
     )
-    return output, final_state, get_last_rwkv7_provider()
+    return output, final_state, get_last_rwkv7_provider(), get_last_rwkv7_kernel()
 
 
 def _run_oracle(
@@ -94,7 +94,8 @@ def _run_oracle(
     scale: float = 1.0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Evaluate the RWKV7 cell sequentially with ordinary PyTorch ops."""
-    r, log_decay, k, v, a, b = inputs
+    r, decay_logits, k, v, a, b = inputs
+    log_decay = -0.6065306597126334 * decay_logits.float().sigmoid()
     recurrent_state = state.float()
     outputs = []
     for token_index in range(r.shape[1]):
@@ -166,7 +167,10 @@ def main() -> None:
     provider_inputs, provider_state = _training_inputs(inputs, state)
     expected, expected_state = _run_oracle(oracle_inputs, oracle_state)
     _backward(expected, expected_state)
-    actual, actual_state, selected_provider = _run_provider(provider_inputs, provider_state)
+    actual, actual_state, selected_provider, selected_kernel = _run_provider(
+        provider_inputs,
+        provider_state,
+    )
     _backward(actual, actual_state)
     torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-3)
     torch.testing.assert_close(actual_state, expected_state, rtol=2e-2, atol=2e-3)
@@ -175,14 +179,14 @@ def main() -> None:
     torch.testing.assert_close(provider_state.grad, oracle_state.grad, rtol=5e-2, atol=5e-3)
     for _ in range(args.warmup):
         warmup_inputs, warmup_state = _training_inputs(inputs, state)
-        warmup_output, warmup_final_state, _ = _run_provider(warmup_inputs, warmup_state)
+        warmup_output, warmup_final_state, _, _ = _run_provider(warmup_inputs, warmup_state)
         _backward(warmup_output, warmup_final_state)
     torch.cuda.synchronize()
     samples = []
     for _ in range(args.iters):
         sample_inputs, sample_state = _training_inputs(inputs, state)
         start = time.perf_counter_ns()
-        sample_output, sample_final_state, _ = _run_provider(sample_inputs, sample_state)
+        sample_output, sample_final_state, _, _ = _run_provider(sample_inputs, sample_state)
         _backward(sample_output, sample_final_state)
         torch.cuda.synchronize()
         samples.append((time.perf_counter_ns() - start) / 1e6)
@@ -197,18 +201,22 @@ def main() -> None:
         )
     report = {
         "schema_version": 1,
-        "label": f"flash-rwkv-recurrent-autograd-{args.dtype}-B{args.batch_size}T{args.tokens}",
+        "label": f"flash-rwkv-raw-decay-recurrent-autograd-{args.dtype}-B{args.batch_size}T{args.tokens}",
         "pr_number": args.pr_number,
         "source_revision": source_revision,
         "backend": selected_provider,
         "selected_provider": selected_provider,
-        "oracle": "explicit-pytorch-sequential-recurrent-autograd",
+        "selected_kernel": selected_kernel,
+        "oracle": "independent-raw-decay-transform-plus-pytorch-sequential-recurrence-autograd",
         "flash_rwkv_source": provider_source,
         "flash_rwkv_source_revision": provider_revision,
         "flash_rwkv_native_extension": native_extension_path,
         "hardware": _hardware(args.runner_label),
         "measurement": {
-            "included": "recurrent_rwkv7 dispatch, exact FlashRWKV recurrent forward and backward, and device synchronization",
+            "included": (
+                "raw-decay recurrent_rwkv7 dispatch, fused FlashRWKV decay transform plus "
+                "recurrent forward and backward, and device synchronization"
+            ),
             "excluded": "input cloning, correctness oracle, warmup, provenance collection, and report serialization",
         },
         "dtype": args.dtype,
@@ -234,6 +242,8 @@ def main() -> None:
     }
     if selected_provider != "flash_rwkv":
         raise RuntimeError(f"provider selection contract failed: {report}")
+    if selected_kernel != "pretrain_recurrent_fp32io16_forward":
+        raise RuntimeError(f"kernel selection contract failed: {report}")
     serialized = json.dumps(report, indent=2, sort_keys=True)
     if args.output:
         args.output.parent.mkdir(parents=True, exist_ok=True)

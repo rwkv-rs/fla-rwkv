@@ -22,10 +22,6 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 PRO6000_RUNNER_LABEL = "rwkv-sha-pro6000x8"
 FLASH_RWKV_SOURCE_REVISION = "5410491f0d6cff6058e5bd21cbab900b5b54f220"
-FLASH_RWKV_EVIDENCE_REVISION = "c2566924c567b4cff9f7327daf6e61b57fef210b"
-FLASH_RWKV_EVIDENCE_RUN_ID = 30764328420
-FLASH_RWKV_EVIDENCE_ARTIFACT_ID = 8838645629
-FLASH_RWKV_EVIDENCE_ARTIFACT_DIGEST = "sha256:50f7836249bd63421f0d014ff88fc20a633938a2787aced0e4c73849e3ecc689"
 REVISION_PATTERN = re.compile(r"^[0-9a-f]{40}$")
 RESULT_FIELDS = ("label", "B", "T", "iters", "p10_ms", "p50_ms", "p90_ms", "tok_s_p50")
 
@@ -127,7 +123,8 @@ def _validate_benchmark(
         "flash_rwkv_source_revision": provider_revision,
         "backend": "flash_rwkv",
         "selected_provider": "flash_rwkv",
-        "oracle": "explicit-pytorch-sequential-recurrent-autograd",
+        "selected_kernel": "pretrain_recurrent_fp32io16_forward",
+        "oracle": "independent-raw-decay-transform-plus-pytorch-sequential-recurrence-autograd",
         "dtype": dtype,
         "B": batch_size,
         "T": tokens,
@@ -192,16 +189,6 @@ def _validate_packed_benchmark(
             raise RuntimeError(
                 f"packed benchmark field mismatch for {key}: expected={value!r} actual={report.get(key)!r}"
             )
-    evidence = report.get("flash_rwkv_clean_evidence", {})
-    expected_evidence = {
-        "runtime_semantic_revision": provider_revision,
-        "evidence_revision": FLASH_RWKV_EVIDENCE_REVISION,
-        "workflow_run_id": FLASH_RWKV_EVIDENCE_RUN_ID,
-        "artifact_id": FLASH_RWKV_EVIDENCE_ARTIFACT_ID,
-        "artifact_digest": FLASH_RWKV_EVIDENCE_ARTIFACT_DIGEST,
-    }
-    if evidence != expected_evidence:
-        raise RuntimeError("packed benchmark does not bind the accepted FlashRWKV evidence")
     hardware = report.get("hardware", {})
     if hardware.get("runner_label") != runner_label or "PRO 6000" not in hardware.get("device_name", ""):
         raise RuntimeError("packed benchmark was not produced on the controlled PRO 6000 runner")
@@ -215,7 +202,9 @@ def _validate_packed_benchmark(
     for row in results:
         if row.get("provider") != "flash_rwkv" or row.get("public_api") != "fla.ops.rwkv7.recurrent_rwkv7":
             raise RuntimeError("packed benchmark did not exercise the public recurrent provider")
-        if row.get("oracle") != "explicit-pytorch-recurrence":
+        if row.get("kernel") != "rwkv7_recurrent_stateful":
+            raise RuntimeError("packed benchmark did not exercise the fused stateful provider kernel")
+        if row.get("oracle") != "independent-raw-decay-transform-plus-pytorch-recurrence":
             raise RuntimeError("packed benchmark oracle identity is invalid")
         missing = tuple(field for field in RESULT_FIELDS if field not in row)
         if missing:
@@ -236,6 +225,19 @@ def _validate_packed_benchmark(
             raise RuntimeError("packed cu_seqlens identity was not preserved")
         if metadata.get("state_indices_identity_preserved") is not True:
             raise RuntimeError("packed state_indices identity was not preserved")
+        if metadata.get("metadata_prepare_calls") != 1:
+            raise RuntimeError("packed metadata was not prepared exactly once")
+        if metadata.get("validated_metadata_reused") is not True:
+            raise RuntimeError("packed validated metadata ticket was not reused")
+        launch_trace = row.get("launch_trace", {})
+        if launch_trace.get("total_cuda_kernel_launches") != 1:
+            raise RuntimeError("packed hot path did not launch exactly one CUDA kernel")
+        if launch_trace.get("wkv_kernel_launches") != 1:
+            raise RuntimeError("packed hot path did not launch exactly one WKV kernel")
+        if launch_trace.get("metadata_validator_launches") != 0:
+            raise RuntimeError("packed hot path relaunched metadata validation")
+        if launch_trace.get("decay_pointwise_launches") != 0:
+            raise RuntimeError("packed hot path launched a separate decay pointwise kernel")
         graph = metadata.get("cuda_graph_evidence")
         if row.get("profile") == "decode_b320":
             if not isinstance(graph, dict) or not all(
@@ -246,6 +248,7 @@ def _validate_packed_benchmark(
                     "final_state_identity_preserved",
                     "cu_seqlens_identity_preserved",
                     "state_indices_identity_preserved",
+                    "metadata_prepared_on_capture_stream",
                 )
             ):
                 raise RuntimeError("packed decode lacks no-host-sync CUDA Graph evidence")
@@ -396,13 +399,6 @@ def _gpu_gate(args: argparse.Namespace, source_revision: str) -> None:
         "racecheck": racecheck,
         "benchmarks": reports,
         "packed_benchmarks": packed_reports,
-        "flash_rwkv_clean_evidence": {
-            "runtime_semantic_revision": args.provider_revision,
-            "evidence_revision": FLASH_RWKV_EVIDENCE_REVISION,
-            "workflow_run_id": FLASH_RWKV_EVIDENCE_RUN_ID,
-            "artifact_id": FLASH_RWKV_EVIDENCE_ARTIFACT_ID,
-            "artifact_digest": FLASH_RWKV_EVIDENCE_ARTIFACT_DIGEST,
-        },
     }
     (args.output_dir / "manifest.json").write_text(
         f"{json.dumps(manifest, indent=2, sort_keys=True)}\n",

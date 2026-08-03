@@ -11,6 +11,7 @@ from fla.ops.backends import BackendRegistry, dispatch
 from fla.ops.rwkv7.backends.flash_rwkv import FlashRWKVBackend
 
 rwkv7_registry = BackendRegistry('rwkv7')
-rwkv7_registry.register(FlashRWKVBackend())
+rwkv7_flash_backend = FlashRWKVBackend()
+rwkv7_registry.register(rwkv7_flash_backend)
 
-__all__ = ['dispatch', 'rwkv7_registry']
+__all__ = ['dispatch', 'rwkv7_flash_backend', 'rwkv7_registry']

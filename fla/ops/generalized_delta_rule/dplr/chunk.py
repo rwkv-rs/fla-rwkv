@@ -37,6 +37,7 @@ def chunk_dplr_fwd(
     a: torch.Tensor,
     b: torch.Tensor,
     gk: torch.Tensor,
+    decay_bias: torch.Tensor | None,
     scale: float,
     initial_state: torch.Tensor,
     output_final_state: bool,
@@ -46,6 +47,7 @@ def chunk_dplr_fwd(
     chunk_indices: torch.LongTensor | None = None,
     disable_recompute: bool = False,
     cp_context: FLACPContext | None = None,
+    rwkv7_decay_logits: bool = False,
 ):
     gi, ge = chunk_rwkv6_fwd_cumsum(
         gk,
@@ -53,6 +55,8 @@ def chunk_dplr_fwd(
         scale=RCP_LN2,
         cu_seqlens=cu_seqlens,
         chunk_indices=chunk_indices,
+        rwkv7_decay_logits=rwkv7_decay_logits,
+        decay_bias=decay_bias,
     )
 
     A_ab, A_qk, A_ak, A_qb, qg, kg, ag, bg = chunk_dplr_fwd_intra(
@@ -143,6 +147,7 @@ class ChunkDPLRDeltaRuleFunction(torch.autograd.Function):
         a: torch.Tensor,
         b: torch.Tensor,
         gk: torch.Tensor,
+        decay_bias: torch.Tensor | None,
         scale: float,
         initial_state: torch.Tensor,
         output_final_state: bool,
@@ -152,6 +157,7 @@ class ChunkDPLRDeltaRuleFunction(torch.autograd.Function):
         chunk_size: int | None = None,
         disable_recompute: bool = False,
         cp_context: FLACPContext | None = None,
+        rwkv7_decay_logits: bool = False,
     ):
         # Due to gate numerical stability consideration, we only support chunk_size=16 when safe_gate=True
         # And in practice, chunk_size=16 is sufficient for no safe gate situations.
@@ -183,6 +189,7 @@ class ChunkDPLRDeltaRuleFunction(torch.autograd.Function):
             a=a,
             b=b,
             gk=gk,
+            decay_bias=decay_bias,
             scale=scale,
             initial_state=initial_state,
             output_final_state=output_final_state,
@@ -192,6 +199,7 @@ class ChunkDPLRDeltaRuleFunction(torch.autograd.Function):
             chunk_indices=chunk_indices,
             disable_recompute=disable_recompute,
             cp_context=cp_context,
+            rwkv7_decay_logits=rwkv7_decay_logits,
         )
 
         if disable_recompute:
@@ -203,6 +211,7 @@ class ChunkDPLRDeltaRuleFunction(torch.autograd.Function):
                 a,
                 b,
                 gk,
+                decay_bias,
                 initial_state,
                 gi,
                 ge,
@@ -219,7 +228,7 @@ class ChunkDPLRDeltaRuleFunction(torch.autograd.Function):
                 A_ab_inv,
             )
         else:
-            ctx.save_for_backward(q, k, v, a, b, gk, initial_state)
+            ctx.save_for_backward(q, k, v, a, b, gk, decay_bias, initial_state)
         ctx.cu_seqlens = cu_seqlens
         ctx.scale = scale
         ctx.chunk_size = chunk_size
@@ -227,6 +236,7 @@ class ChunkDPLRDeltaRuleFunction(torch.autograd.Function):
         ctx.safe_gate = safe_gate
         ctx.disable_recompute = disable_recompute
         ctx.cp_context = cp_context
+        ctx.rwkv7_decay_logits = rwkv7_decay_logits
         return o.to(q.dtype), final_state
 
     @staticmethod
@@ -245,6 +255,7 @@ class ChunkDPLRDeltaRuleFunction(torch.autograd.Function):
                 a,
                 b,
                 gk,
+                decay_bias,
                 initial_state,
                 gi,
                 ge,
@@ -261,7 +272,7 @@ class ChunkDPLRDeltaRuleFunction(torch.autograd.Function):
                 A_ab_inv,
             ) = ctx.saved_tensors
         else:
-            q, k, v, a, b, gk, initial_state = ctx.saved_tensors
+            q, k, v, a, b, gk, decay_bias, initial_state = ctx.saved_tensors
         chunk_size = ctx.chunk_size
         cu_seqlens = ctx.cu_seqlens
         scale = ctx.scale
@@ -282,6 +293,8 @@ class ChunkDPLRDeltaRuleFunction(torch.autograd.Function):
                 scale=RCP_LN2,
                 cu_seqlens=cu_seqlens,
                 chunk_indices=ctx.chunk_indices,
+                rwkv7_decay_logits=ctx.rwkv7_decay_logits,
+                decay_bias=decay_bias,
             )
 
             A_ab, A_qk, A_ak, A_qb, qg, kg, ag, bg = chunk_dplr_fwd_intra(
@@ -409,7 +422,7 @@ class ChunkDPLRDeltaRuleFunction(torch.autograd.Function):
         )
         del A_ak
 
-        dq, dk, da, db, dgk = chunk_dplr_bwd_dqk_intra(
+        dq, dk, da, db, dgk, d_decay_bias = chunk_dplr_bwd_dqk_intra(
             q=q,
             k=k,
             a=a,
@@ -430,11 +443,15 @@ class ChunkDPLRDeltaRuleFunction(torch.autograd.Function):
             cu_seqlens=cu_seqlens,
             safe_gate=ctx.safe_gate,
             chunk_indices=ctx.chunk_indices,
+            gk=gk,
+            decay_bias=decay_bias,
+            output_decay_bias_grad=ctx.needs_input_grad[6],
+            rwkv7_decay_logits=ctx.rwkv7_decay_logits,
         )
 
         return (
-            dq.to(q), dk.to(k), dv.to(v), da.to(a), db.to(b), dgk.to(gk),
-            None, dh0, None, None, None, None, None, None, None,
+            dq.to(q), dk.to(k), dv.to(v), da.to(a), db.to(b), dgk.to(gk), d_decay_bias,
+            None, dh0, None, None, None, None, None, None, None, None,
         )
 
 
@@ -455,6 +472,8 @@ def chunk_dplr_delta_rule(
     chunk_size: int | None = None,
     disable_recompute: bool = False,
     cp_context: FLACPContext | None = None,
+    _rwkv7_decay_logits: bool = False,
+    _rwkv7_decay_bias: torch.Tensor | None = None,
     **kwargs,
 ):
     r"""
@@ -541,6 +560,7 @@ def chunk_dplr_delta_rule(
         a,
         b,
         gk,
+        _rwkv7_decay_bias,
         scale,
         initial_state,
         output_final_state,
@@ -550,5 +570,6 @@ def chunk_dplr_delta_rule(
         chunk_size,
         disable_recompute,
         cp_context,
+        _rwkv7_decay_logits,
     )
     return o, final_state

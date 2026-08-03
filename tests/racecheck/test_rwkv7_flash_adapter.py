@@ -13,7 +13,9 @@ import torch
 
 from fla.ops.rwkv7 import (
     FLASH_RWKV_SOURCE_REVISION,
+    get_last_rwkv7_kernel,
     get_last_rwkv7_provider,
+    prepare_rwkv7_recurrent_metadata,
     recurrent_rwkv7,
     validate_flash_rwkv_installation,
 )
@@ -31,12 +33,24 @@ def main() -> None:
     )
     cu_seqlens = torch.tensor([0, 2, 3], device="cuda", dtype=torch.int32)
     state_indices = torch.tensor([4, 1], device="cuda", dtype=torch.int32)
+    decay_bias = torch.randn(1, 64, device="cuda", dtype=torch.float16).contiguous()
+    validated_metadata = prepare_rwkv7_recurrent_metadata(
+        cu_seqlens,
+        state_indices,
+        total_tokens=shape[1],
+        state_pool_size=6,
+    )
     operations = []
     for mode, state_dtype in (
         ("fp32io16", torch.float32),
         ("fp16", torch.float16),
     ):
         state_pool = torch.zeros(6, 1, 64, 64, device="cuda", dtype=state_dtype)
+        elapsed_t = (
+            torch.zeros(state_pool.shape[0], device="cuda", dtype=torch.int32)
+            if mode == "fp16"
+            else None
+        )
         untouched_before = state_pool[[0, 2, 3, 5]].clone()
         output, final_state = recurrent_rwkv7(
             *inputs,
@@ -45,12 +59,17 @@ def main() -> None:
             cu_seqlens=cu_seqlens,
             state_indices=state_indices,
             mode=mode,
+            decay_bias=decay_bias,
+            elapsed_t=elapsed_t,
+            validated_metadata=validated_metadata,
         )
         torch.cuda.synchronize()
         if final_state is not state_pool:
             raise RuntimeError("packed final state lost input state-pool identity")
         if get_last_rwkv7_provider() != "flash_rwkv":
             raise RuntimeError("packed racecheck did not use FlashRWKV")
+        if get_last_rwkv7_kernel() != "rwkv7_recurrent_stateful":
+            raise RuntimeError("packed racecheck did not use the fused stateful kernel")
         if not torch.equal(state_pool[[0, 2, 3, 5]], untouched_before):
             raise RuntimeError("packed racecheck modified an unselected state row")
         if not torch.isfinite(output).all():

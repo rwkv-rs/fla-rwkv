@@ -34,7 +34,8 @@ def _run_rwkv7_operator(
     mode: str,
     *,
     r: torch.Tensor,
-    w: torch.Tensor,
+    decay_logits: torch.Tensor,
+    decay_bias: torch.Tensor | None,
     k: torch.Tensor,
     v: torch.Tensor,
     kk: torch.Tensor | None,
@@ -58,7 +59,8 @@ def _run_rwkv7_operator(
             recurrence_b = flash_b
         return recurrent_rwkv7(
             r=r,
-            w=w,
+            decay_logits=decay_logits,
+            decay_bias=decay_bias,
             k=k,
             v=v,
             a=recurrence_a,
@@ -73,7 +75,8 @@ def _run_rwkv7_operator(
             raise ValueError("chunk mode requires explicit normalized key and gate tensors")
         return chunk_rwkv7(
             r=r,
-            w=w,
+            decay_logits=decay_logits,
+            decay_bias=decay_bias,
             k=k,
             v=v,
             a=-kk,
@@ -90,7 +93,8 @@ def _run_rwkv7_operator(
             raise ValueError("fused_recurrent mode requires explicit normalized key and gate tensors")
         return fused_mul_recurrent_rwkv7(
             r=r,
-            w=w,
+            decay_logits=decay_logits,
+            decay_bias=decay_bias,
             k=k,
             v=v,
             kk=kk,
@@ -382,15 +386,15 @@ class RWKV7Attention(nn.Module):
             )
 
         r = self.r_proj(xr)
-        # Using bf16 for LoRA computation is numerically safe here because:
-        # 1. After sigmoid activation:
-        #    - Max absolute error (vs float32): 0.003
-        #    - Mean absolute error: 0.0004
-        # 2. Subsequent scaling by -0.6065 will further reduce relative error
-        #    (error scales linearly with constant multiplication)
-        # 3. Final compounded error remains within acceptable bounds for bf16 precision
-        # Empirical observation confirms bf16 introduces no practical degradation
-        w = -0.6065306597126334 * self.w_lora(xw).sigmoid()
+        if self.mode == 'recurrent' and self.training:
+            # FlashRWKV's native training autograd consumes combined raw z and
+            # propagates dz through the fused retention transform.
+            decay_logits = self.w_lora(xw)
+            decay_bias = None
+        else:
+            # Inference and the local chunk kernel fuse this broadcast bias at
+            # the consumer boundary, avoiding an add materialization.
+            decay_logits, decay_bias = _lora_delta_and_bias(self.w_lora, xw)
 
         k = self.k_proj(xk)
         v = self.v_proj(xv)
@@ -455,7 +459,12 @@ class RWKV7Attention(nn.Module):
         if attention_mask is not None:
             v = v * am
 
-        r, w, k = map(lambda x: rearrange(x, 'b t (h d) -> b t h d', d=self.head_dim), (r, w, k))
+        r, decay_logits, k = map(
+            lambda x: rearrange(x, 'b t (h d) -> b t h d', d=self.head_dim),
+            (r, decay_logits, k),
+        )
+        if decay_bias is not None:
+            decay_bias = decay_bias.reshape(self.num_heads, self.head_dim)
         if a is not None:
             a = rearrange(a, 'b t (h d) -> b t h d', d=self.head_dim)
         if flash_a is not None:
@@ -466,7 +475,8 @@ class RWKV7Attention(nn.Module):
         o, recurrent_state = _run_rwkv7_operator(
             self.mode,
             r=r,
-            w=w,
+            decay_logits=decay_logits,
+            decay_bias=decay_bias,
             k=k,
             v=v,
             kk=kk,

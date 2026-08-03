@@ -9,7 +9,6 @@ import torch
 import triton
 import triton.language as tl
 
-from fla.ops.generalized_delta_rule import fused_recurrent_dplr_delta_rule
 from fla.ops.utils.op import exp
 from fla.utils import autotune_cache_kwargs, input_guard
 
@@ -18,6 +17,7 @@ from fla.utils import autotune_cache_kwargs, input_guard
     'USE_INITIAL_STATE': lambda args: args['h0'] is not None,
     'STORE_FINAL_STATE': lambda args: args['ht'] is not None,
     'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
+    'HAS_DECAY_BIAS': lambda args: args['decay_bias'] is not None,
 })
 @triton.autotune(
     configs=[
@@ -32,7 +32,8 @@ from fla.utils import autotune_cache_kwargs, input_guard
 @triton.jit(do_not_specialize=['T'])
 def fused_recurrent_rwkv7_fwd_kernel(
     r,
-    w,
+    decay,
+    decay_bias,
     k,
     v,
     kk,
@@ -54,6 +55,8 @@ def fused_recurrent_rwkv7_fwd_kernel(
     STORE_FINAL_STATE: tl.constexpr,
     IS_VARLEN: tl.constexpr,
     IS_DECODE: tl.constexpr,
+    HAS_DECAY_BIAS: tl.constexpr,
+    RWKV7_DECAY_LOGITS: tl.constexpr,
 ):
     i_v, i_nh = tl.program_id(0).to(tl.int64), tl.program_id(1).to(tl.int64)
     i_n, i_h = i_nh // H, i_nh % H
@@ -67,7 +70,9 @@ def fused_recurrent_rwkv7_fwd_kernel(
     o_k = tl.arange(0, BK)
     o_v = i_v * BV + tl.arange(0, BV)
     p_r = r + (bos + ((T - 1) if REVERSE else 0)) * H*K + i_h * K + o_k
-    p_w = w + (bos + ((T - 1) if REVERSE else 0)) * H*K + i_h * K + o_k
+    p_decay = decay + (bos + ((T - 1) if REVERSE else 0)) * H*K + i_h * K + o_k
+    if HAS_DECAY_BIAS:
+        p_decay_bias = decay_bias + i_h * K + o_k
     p_k = k + (bos + ((T - 1) if REVERSE else 0)) * H*K + i_h * K + o_k
     p_v = v + (bos + ((T - 1) if REVERSE else 0)) * H*V + i_h * V + o_v
     p_a = a + (bos + ((T - 1) if REVERSE else 0)) * H*K + i_h * K + o_k
@@ -86,7 +91,11 @@ def fused_recurrent_rwkv7_fwd_kernel(
 
     if IS_DECODE:
         b_r = tl.load(p_r, mask=mask_k, other=0).to(tl.float32) * scale
-        b_w = tl.load(p_w, mask=mask_k, other=0).to(tl.float32)
+        b_w = tl.load(p_decay, mask=mask_k, other=0).to(tl.float32)
+        if RWKV7_DECAY_LOGITS:
+            if HAS_DECAY_BIAS:
+                b_w += tl.load(p_decay_bias, mask=mask_k, other=0).to(tl.float32)
+            b_w = -0.6065306597126334 * tl.sigmoid(b_w)
         b_k = tl.load(p_k, mask=mask_k, other=0).to(tl.float32)
         b_v = tl.load(p_v, mask=mask_v, other=0).to(tl.float32)
         b_a = tl.load(p_a, mask=mask_k, other=0).to(tl.float32)
@@ -102,7 +111,11 @@ def fused_recurrent_rwkv7_fwd_kernel(
     else:
         for _ in range(0, T):
             b_r = tl.load(p_r, mask=mask_k, other=0).to(tl.float32) * scale
-            b_w = tl.load(p_w, mask=mask_k, other=0).to(tl.float32)
+            b_w = tl.load(p_decay, mask=mask_k, other=0).to(tl.float32)
+            if RWKV7_DECAY_LOGITS:
+                if HAS_DECAY_BIAS:
+                    b_w += tl.load(p_decay_bias, mask=mask_k, other=0).to(tl.float32)
+                b_w = -0.6065306597126334 * tl.sigmoid(b_w)
             b_k = tl.load(p_k, mask=mask_k, other=0).to(tl.float32)
             b_v = tl.load(p_v, mask=mask_v, other=0).to(tl.float32)
             b_a = tl.load(p_a, mask=mask_k, other=0).to(tl.float32)
@@ -116,7 +129,7 @@ def fused_recurrent_rwkv7_fwd_kernel(
 
             tl.store(p_o, b_o.to(p_o.dtype.element_ty), mask=mask_v)
             p_r += (-1 if REVERSE else 1) * H*K
-            p_w += (-1 if REVERSE else 1) * H*K
+            p_decay += (-1 if REVERSE else 1) * H*K
             p_k += (-1 if REVERSE else 1) * H*K
             p_v += (-1 if REVERSE else 1) * H*V
             p_a += (-1 if REVERSE else 1) * H*K
@@ -131,7 +144,7 @@ def fused_recurrent_rwkv7_fwd_kernel(
 @input_guard
 def fused_recurrent_rwkv7_fwd(
     r: torch.Tensor,
-    w: torch.Tensor,
+    decay: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
     kk: torch.Tensor,
@@ -141,6 +154,8 @@ def fused_recurrent_rwkv7_fwd(
     output_final_state: bool = False,
     reverse: bool = False,
     cu_seqlens: torch.LongTensor | None = None,
+    decay_bias: torch.Tensor | None = None,
+    rwkv7_decay_logits: bool = True,
 ):
     B, T, H, K, V = *k.shape, v.shape[-1]
     N = B if cu_seqlens is None else len(cu_seqlens) - 1
@@ -157,7 +172,8 @@ def fused_recurrent_rwkv7_fwd(
     def grid(meta): return (triton.cdiv(V, meta['BV']), N * H)
     fused_recurrent_rwkv7_fwd_kernel[grid](
         r,
-        w,
+        decay,
+        decay_bias,
         k,
         v,
         kk,
@@ -175,13 +191,14 @@ def fused_recurrent_rwkv7_fwd(
         BK=BK,
         REVERSE=reverse,
         IS_DECODE=IS_DECODE,
+        RWKV7_DECAY_LOGITS=rwkv7_decay_logits,
     )
     return o, ht
 
 
 def fused_recurrent_rwkv7(
     r: torch.Tensor,
-    w: torch.Tensor,
+    decay_logits: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
     a: torch.Tensor,
@@ -190,55 +207,34 @@ def fused_recurrent_rwkv7(
     initial_state: torch.Tensor | None = None,
     output_final_state: bool = True,
     cu_seqlens: torch.LongTensor | None = None,
+    decay_bias: torch.Tensor | None = None,
+    elapsed_t: torch.Tensor | None = None,
     **kwargs,
 ):
-    """
-    Args:
-        r (torch.Tensor):
-            r of shape `[B, T, H, K]`.
-        w (torch.Tensor):
-            log decay of shape `[B, T, H, K]`.
-        k (torch.Tensor):
-            k of shape `[B, T, H, K]`.
-        v (torch.Tensor):
-            v of shape `[B, T, H, V]`.
-        a (torch.Tensor):
-            a of shape `[B, T, H, K]`.
-        b (torch.Tensor):
-            b of shape `[B, T, H, K]`.
-        scale (Optional[float]):
-            Scale factor for the attention scores.
-            If not provided, it will default to `1 / sqrt(K)`. Default: `None`.
-        initial_state (Optional[torch.Tensor]):
-            Initial state of shape `[B, H, K, V]` if `cu_seqlens` is `None`,
-            else `[N, H, K, V]` where `N = len(cu_seqlens) - 1`. Default: `None`.
-        output_final_state (Optional[bool]):
-            Whether to output the final state. Default: `True`.
-        cu_seqlens (torch.LongTensor):
-            Cumulative sequence lengths of shape `[N+1]` used for variable-length training,
-            consistent with the FlashAttention API.
-    """
-    if 'head_first' in kwargs:
-        raise DeprecationWarning(
-            "head_first has been removed. Inputs must be in `[B, T, H, ...]` format.",
-        )
-    return fused_recurrent_dplr_delta_rule(
-        q=r,
-        k=k,
-        v=v,
-        a=a,
-        b=b,
-        gk=w,
-        scale=scale,
+    """Product fused recurrence consuming raw checkpoint decay logits."""
+
+    from fla.ops.rwkv7.recurrent import recurrent_rwkv7
+
+    return recurrent_rwkv7(
+        r,
+        decay_logits,
+        k,
+        v,
+        a,
+        b,
+        scale=r.shape[-1] ** -0.5 if scale is None else scale,
         initial_state=initial_state,
         output_final_state=output_final_state,
         cu_seqlens=cu_seqlens,
+        decay_bias=decay_bias,
+        elapsed_t=elapsed_t,
+        **kwargs,
     )
 
 
 def fused_mul_recurrent_rwkv7(
     r: torch.Tensor,
-    w: torch.Tensor,
+    decay_logits: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
     kk: torch.Tensor,
@@ -248,6 +244,7 @@ def fused_mul_recurrent_rwkv7(
     output_final_state: bool = False,
     reverse: bool = False,
     cu_seqlens: torch.Tensor | None = None,
+    decay_bias: torch.Tensor | None = None,
     **kwargs,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     r"""
@@ -256,8 +253,8 @@ def fused_mul_recurrent_rwkv7(
     Args:
         r (torch.Tensor):
             queries of shape `[B, T, H, K]`.
-        w (torch.Tensor):
-            log decay of shape `[B, T, H, K]`.
+        decay_logits (torch.Tensor):
+            Raw checkpoint decay logits of shape `[B, T, H, K]`.
         k (torch.Tensor):
             keys of shape `[B, T, H, K]`.
         v (torch.Tensor):
@@ -299,7 +296,7 @@ def fused_mul_recurrent_rwkv7(
         scale = r.shape[-1] ** -0.5
     o, final_state = fused_recurrent_rwkv7_fwd(
         r,
-        w,
+        decay_logits,
         k,
         v,
         kk,
@@ -309,5 +306,7 @@ def fused_mul_recurrent_rwkv7(
         output_final_state,
         reverse,
         cu_seqlens,
+        decay_bias,
+        True,
     )
     return o, final_state

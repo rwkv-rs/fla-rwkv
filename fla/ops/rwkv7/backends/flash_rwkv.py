@@ -18,6 +18,7 @@ import math
 import re
 import subprocess
 from dataclasses import dataclass
+from functools import cache
 from pathlib import Path
 from threading import Lock
 from types import ModuleType
@@ -37,13 +38,8 @@ if TYPE_CHECKING:
 
 FLASH_RWKV_SOURCE_REVISION = "5410491f0d6cff6058e5bd21cbab900b5b54f220"
 FLASH_RWKV_REPOSITORY = "https://github.com/rwkv-rs/FlashRWKV.git"
-FLASH_RWKV_PUBLIC_OPERATORS = (
-    "decay_logits_to_log_decay",
-    "infer_chunk_bf16_forward",
-    "infer_chunk_bf16_forward_varlen",
+FLASH_RWKV_REQUIRED_OPERATORS = (
     "infer_cmix_mix_fp16",
-    "infer_recurrent_fp16_forward_varlen",
-    "infer_recurrent_fp32io16_forward_varlen",
     "infer_tmix_kk_a_gate_fp16",
     "infer_tmix_lnx_rkvres_xg_fp16",
     "infer_tmix_mix6_fp16",
@@ -51,19 +47,25 @@ FLASH_RWKV_PUBLIC_OPERATORS = (
     "pretrain_cmix_bf16",
     "pretrain_head_l2wrap_ce_bf16",
     "pretrain_l2wrap_ce_bf16",
-    "pretrain_recurrent_fp32io16",
     "pretrain_recurrent_fp32io16_forward",
     "pretrain_tmix_a_gate_bf16",
     "pretrain_tmix_kk_pre_bf16",
     "pretrain_tmix_lnx_rkvres_xg_bf16",
     "pretrain_tmix_mix6_bf16",
     "pretrain_tmix_vres_gate_bf16",
-    "rl_infctx_chunk_fp32io16_factor_recompute",
+    "prepare_recurrent_metadata",
     "rwkv7",
-    "rwkv7_from_decay_logits",
+    "rwkv7_recurrent",
     "rwkv7_recurrent_stateful",
-    "rwkv7_reference",
-    "statetune_recurrent_fp32io16_forward",
+)
+FLASH_RWKV_PUBLIC_OPERATORS = tuple(
+    {
+        "pretrain_recurrent_fp32io16_forward": "pretrain_recurrent_fp32io16_from_decay_logits",
+        "rwkv7": "rwkv7_from_decay_logits",
+        "rwkv7_recurrent": "rwkv7_recurrent_from_decay_logits",
+        "rwkv7_recurrent_stateful": "rwkv7_recurrent_stateful_from_decay_logits",
+    }.get(name, name)
+    for name in FLASH_RWKV_REQUIRED_OPERATORS
 )
 
 
@@ -158,7 +160,7 @@ def _validate_public_api(module: ModuleType) -> None:
         raise FlashRWKVProvenanceError("FlashRWKV version must be at least 0.1.0")
     missing_operators = tuple(
         name
-        for name in FLASH_RWKV_PUBLIC_OPERATORS
+        for name in FLASH_RWKV_REQUIRED_OPERATORS
         if not callable(getattr(module, name, None))
     )
     if missing_operators:
@@ -167,16 +169,23 @@ def _validate_public_api(module: ModuleType) -> None:
             f"{', '.join(missing_operators)}"
         )
     try:
-        parameters = inspect.signature(module.rwkv7).parameters
-        stateful_parameters = inspect.signature(module.rwkv7_recurrent_stateful).parameters
-        training_parameters = inspect.signature(
+        raw_parameters = inspect.signature(
+            module.rwkv7_recurrent
+        ).parameters
+        raw_stateful_parameters = inspect.signature(
+            module.rwkv7_recurrent_stateful
+        ).parameters
+        raw_training_parameters = inspect.signature(
             module.pretrain_recurrent_fp32io16_forward
+        ).parameters
+        prepare_metadata_parameters = inspect.signature(
+            module.prepare_recurrent_metadata
         ).parameters
     except (AttributeError, TypeError, ValueError) as error:
         raise FlashRWKVProvenanceError("FlashRWKV public RWKV7 API is unavailable") from error
-    required_parameters = {
+    required_raw_parameters = {
         "r",
-        "log_decay",
+        "decay_logits",
         "k",
         "v",
         "a",
@@ -185,13 +194,15 @@ def _validate_public_api(module: ModuleType) -> None:
         "initial_state",
         "output_final_state",
         "cu_seqlens",
+        "state_indices",
         "mode",
-        "algorithm",
-        "chunk_size",
+        "decay_bias",
+        "elapsed_t",
+        "validated_metadata",
     }
-    required_stateful_parameters = {
+    required_raw_stateful_parameters = {
         "r",
-        "log_decay",
+        "decay_logits",
         "k",
         "v",
         "a",
@@ -201,10 +212,13 @@ def _validate_public_api(module: ModuleType) -> None:
         "state_indices",
         "scale",
         "mode",
+        "decay_bias",
+        "elapsed_t",
+        "validated_metadata",
     }
-    required_training_parameters = {
+    required_raw_training_parameters = {
         "r",
-        "log_decay",
+        "decay_logits",
         "k",
         "v",
         "a",
@@ -212,16 +226,30 @@ def _validate_public_api(module: ModuleType) -> None:
         "scale",
         "initial_state",
         "output_final_state",
+        "decay_bias",
+        "elapsed_t",
     }
-    if not required_parameters <= parameters.keys():
-        raise FlashRWKVProvenanceError("FlashRWKV rwkv7 signature is incompatible")
-    if not required_stateful_parameters <= stateful_parameters.keys():
+    required_prepare_metadata_parameters = {
+        "cu_seqlens",
+        "state_indices",
+        "total_tokens",
+        "state_pool_size",
+    }
+    if not required_raw_parameters <= raw_parameters.keys():
         raise FlashRWKVProvenanceError(
-            "FlashRWKV rwkv7_recurrent_stateful signature is incompatible"
+            "FlashRWKV raw-decay recurrent signature is incompatible"
         )
-    if not required_training_parameters <= training_parameters.keys():
+    if not required_raw_stateful_parameters <= raw_stateful_parameters.keys():
         raise FlashRWKVProvenanceError(
-            "FlashRWKV recurrent autograd signature is incompatible"
+            "FlashRWKV raw-decay stateful recurrent signature is incompatible"
+        )
+    if not required_raw_training_parameters <= raw_training_parameters.keys():
+        raise FlashRWKVProvenanceError(
+            "FlashRWKV raw-decay recurrent autograd signature is incompatible"
+        )
+    if not required_prepare_metadata_parameters <= prepare_metadata_parameters.keys():
+        raise FlashRWKVProvenanceError(
+            "FlashRWKV recurrent metadata preparation signature is incompatible"
         )
     if not callable(getattr(module, "validate_packed_metadata_strict", None)):
         raise FlashRWKVProvenanceError(
@@ -350,7 +378,6 @@ def preflight_flash_rwkv_installation(*, refresh: bool = False) -> FlashRWKVProv
     result = _flash_rwkv_preflight_result
     if not refresh and result is not _FLASH_RWKV_PREFLIGHT_UNSET:
         return _resolve_flash_rwkv_preflight(result)
-
     with _flash_rwkv_preflight_lock:
         result = _flash_rwkv_preflight_result
         if refresh or result is _FLASH_RWKV_PREFLIGHT_UNSET:
@@ -360,6 +387,14 @@ def preflight_flash_rwkv_installation(*, refresh: bool = False) -> FlashRWKVProv
                 result = error
             _flash_rwkv_preflight_result = result
         return _resolve_flash_rwkv_preflight(result)
+
+
+@cache
+def _load_flash_rwkv_provider() -> ModuleType:
+    """Resolve the admitted provider once for recurrent hot-path reuse."""
+
+    preflight_flash_rwkv_installation()
+    return importlib.import_module("flash_rwkv")
 
 
 class FlashRWKVBackend(BaseBackend):
@@ -379,10 +414,10 @@ class FlashRWKVBackend(BaseBackend):
             return False
         return True
 
-    def recurrent_rwkv7_verifier(
+    def _recurrent_verifier(
         self,
         r: torch.Tensor,
-        w: torch.Tensor,
+        decay: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
         a: torch.Tensor,
@@ -398,9 +433,12 @@ class FlashRWKVBackend(BaseBackend):
         chunk_size: int | None = None,
         disable_recompute: bool = False,
         cp_context: FLACPContext | None = None,
+        decay_bias: torch.Tensor | None = None,
+        elapsed_t: torch.Tensor | None = None,
+        validated_metadata: object | None = None,
         **kwargs,
     ) -> tuple[bool, str | None]:
-        tensors = (r, w, k, v, a, b)
+        tensors = (r, decay, k, v, a, b)
         if any(getattr(tensor, "ndim", None) != 4 for tensor in tensors):
             return False, "FlashRWKV requires rank-4 [B, T, H, D] inputs"
         if any(not tensor.is_contiguous() for tensor in tensors):
@@ -411,7 +449,7 @@ class FlashRWKVBackend(BaseBackend):
             return False, "FlashRWKV requires float16 or bfloat16 inputs"
         if any(tensor.device != r.device for tensor in tensors):
             return False, "FlashRWKV requires all inputs on the same CUDA device"
-        if any(tensor.shape != r.shape for tensor in (w, k, a, b)) or v.shape[:3] != r.shape[:3]:
+        if any(tensor.shape != r.shape for tensor in (decay, k, a, b)) or v.shape[:3] != r.shape[:3]:
             return False, "FlashRWKV requires matching [B, T, H, D] input shapes"
         if any(dimension <= 0 for dimension in r.shape) or v.shape[-1] <= 0:
             return False, "FlashRWKV requires positive B, T, H, K, and V dimensions"
@@ -430,9 +468,30 @@ class FlashRWKVBackend(BaseBackend):
             return False, "FlashRWKV mode must be 'fp32io16' or 'fp16'"
         if mode == "fp16" and any(tensor.dtype != torch.float16 for tensor in tensors):
             return False, "FlashRWKV mode='fp16' requires float16 inputs"
+        if decay_bias is not None:
+            if (
+                decay_bias.ndim not in {1, 2}
+                or decay_bias.numel() != r.shape[2] * r.shape[3]
+            ):
+                return False, "FlashRWKV decay_bias must have shape [H, D] or flattened [H*D]"
+            if not decay_bias.is_cuda or decay_bias.device != r.device:
+                return False, "FlashRWKV decay_bias must be on the input CUDA device"
+            if not decay_bias.is_contiguous() or decay_bias.dtype != r.dtype:
+                return False, "FlashRWKV decay_bias must be contiguous and match the token dtype"
+        if elapsed_t is not None:
+            if mode != "fp16":
+                return False, "FlashRWKV elapsed_t is only valid for mode='fp16'"
+            if elapsed_t.ndim != 1 or elapsed_t.dtype != torch.int32:
+                return False, "FlashRWKV elapsed_t must be a rank-1 int32 tensor"
+            if not elapsed_t.is_cuda or elapsed_t.device != r.device or not elapsed_t.is_contiguous():
+                return False, "FlashRWKV elapsed_t must be contiguous on the input CUDA device"
         requires_grad = any(tensor.requires_grad for tensor in tensors) or (
             initial_state is not None and initial_state.requires_grad
         )
+        if requires_grad and (decay_bias is not None or elapsed_t is not None):
+            return False, "FlashRWKV training requires combined decay logits and no elapsed_t"
+        if requires_grad and validated_metadata is not None:
+            return False, "FlashRWKV training does not accept validated packed metadata"
         if requires_grad and cu_seqlens is not None:
             return False, "FlashRWKV packed execution is forward-only"
         if requires_grad and mode != "fp32io16":
@@ -467,6 +526,8 @@ class FlashRWKVBackend(BaseBackend):
                     return False, "FlashRWKV state_indices length must match the packed sequence count"
         elif state_indices is not None:
             return False, "FlashRWKV state_indices requires cu_seqlens"
+        if validated_metadata is not None and (cu_seqlens is None or state_indices is None):
+            return False, "FlashRWKV validated_metadata requires packed stateful metadata"
         if initial_state is not None:
             expected_trailing_shape = (r.shape[2], r.shape[3], v.shape[3])
             if (
@@ -500,10 +561,10 @@ class FlashRWKVBackend(BaseBackend):
             return False, f"FlashRWKV does not support extra arguments: {sorted(kwargs)}"
         return True, None
 
-    def recurrent_rwkv7(
+    def recurrent_rwkv7_verifier(
         self,
         r: torch.Tensor,
-        w: torch.Tensor,
+        decay_logits: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
         a: torch.Tensor,
@@ -519,22 +580,90 @@ class FlashRWKVBackend(BaseBackend):
         chunk_size: int | None = None,
         disable_recompute: bool = False,
         cp_context: FLACPContext | None = None,
+        decay_bias: torch.Tensor | None = None,
+        elapsed_t: torch.Tensor | None = None,
+        validated_metadata: object | None = None,
+        **kwargs,
+    ) -> tuple[bool, str | None]:
+        return self._recurrent_verifier(
+            r,
+            decay_logits,
+            k,
+            v,
+            a,
+            b,
+            scale=scale,
+            initial_state=initial_state,
+            output_final_state=output_final_state,
+            cu_seqlens=cu_seqlens,
+            cu_seqlens_cpu=cu_seqlens_cpu,
+            state_indices=state_indices,
+            mode=mode,
+            safe_gate=safe_gate,
+            chunk_size=chunk_size,
+            disable_recompute=disable_recompute,
+            cp_context=cp_context,
+            decay_bias=decay_bias,
+            elapsed_t=elapsed_t,
+            validated_metadata=validated_metadata,
+            **kwargs,
+        )
+
+    def prepare_recurrent_metadata(
+        self,
+        cu_seqlens: torch.Tensor,
+        state_indices: torch.Tensor,
+        *,
+        total_tokens: int,
+        state_pool_size: int,
+    ) -> object:
+        flash_rwkv = _load_flash_rwkv_provider()
+        return flash_rwkv.prepare_recurrent_metadata(
+            cu_seqlens,
+            state_indices,
+            total_tokens=total_tokens,
+            state_pool_size=state_pool_size,
+        )
+
+    def recurrent_rwkv7(
+        self,
+        r: torch.Tensor,
+        decay_logits: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        a: torch.Tensor,
+        b: torch.Tensor,
+        scale: float = 1.0,
+        initial_state: torch.Tensor | None = None,
+        output_final_state: bool = False,
+        cu_seqlens: torch.LongTensor | None = None,
+        cu_seqlens_cpu: torch.LongTensor | None = None,
+        state_indices: torch.LongTensor | None = None,
+        mode: str = "fp32io16",
+        safe_gate: bool = False,
+        chunk_size: int | None = None,
+        disable_recompute: bool = False,
+        cp_context: FLACPContext | None = None,
+        decay_bias: torch.Tensor | None = None,
+        elapsed_t: torch.Tensor | None = None,
+        validated_metadata: object | None = None,
         **kwargs,
     ):
         del cu_seqlens_cpu, safe_gate, chunk_size, disable_recompute, cp_context, kwargs
-        import flash_rwkv
-
         set_last_rwkv7_provider(None)
         set_last_rwkv7_kernel(None)
+        flash_rwkv = _load_flash_rwkv_provider()
         requires_grad = any(
             tensor is not None and tensor.requires_grad
-            for tensor in (r, w, k, v, a, b, initial_state)
+            for tensor in (r, decay_logits, k, v, a, b, initial_state)
         )
+        if requires_grad and validated_metadata is not None:
+            raise ValueError("validated_metadata is only supported for packed inference")
         if state_indices is not None:
             kernel = "rwkv7_recurrent_stateful"
             output = flash_rwkv.rwkv7_recurrent_stateful(
                 r,
-                w,
+                decay_logits,
                 k,
                 v,
                 a,
@@ -544,13 +673,16 @@ class FlashRWKVBackend(BaseBackend):
                 state_indices=state_indices,
                 scale=scale,
                 mode=mode,
+                decay_bias=decay_bias,
+                elapsed_t=elapsed_t,
+                validated_metadata=validated_metadata,
             )
             output = (output, initial_state)
         elif requires_grad:
             kernel = "pretrain_recurrent_fp32io16_forward"
             output = flash_rwkv.pretrain_recurrent_fp32io16_forward(
                 r,
-                w,
+                decay_logits,
                 k,
                 v,
                 a,
@@ -558,12 +690,14 @@ class FlashRWKVBackend(BaseBackend):
                 scale=scale,
                 initial_state=initial_state,
                 output_final_state=output_final_state,
+                decay_bias=decay_bias,
+                elapsed_t=elapsed_t,
             )
         else:
-            kernel = "rwkv7"
-            output = flash_rwkv.rwkv7(
+            kernel = "rwkv7_recurrent"
+            output = flash_rwkv.rwkv7_recurrent(
                 r,
-                w,
+                decay_logits,
                 k,
                 v,
                 a,
@@ -572,21 +706,25 @@ class FlashRWKVBackend(BaseBackend):
                 initial_state=initial_state,
                 output_final_state=output_final_state,
                 cu_seqlens=cu_seqlens,
+                state_indices=None,
                 mode=mode,
-                algorithm="recurrent",
+                decay_bias=decay_bias,
+                elapsed_t=elapsed_t,
+                validated_metadata=validated_metadata,
             )
         set_last_rwkv7_provider("flash_rwkv")
         set_last_rwkv7_kernel(kernel)
         return output
 
-
 __all__ = [
     "FLASH_RWKV_PUBLIC_OPERATORS",
     "FLASH_RWKV_REPOSITORY",
+    "FLASH_RWKV_REQUIRED_OPERATORS",
     "FLASH_RWKV_SOURCE_REVISION",
     "FlashRWKVBackend",
     "FlashRWKVProvenance",
     "FlashRWKVProvenanceError",
+    "_load_flash_rwkv_provider",
     "preflight_flash_rwkv_installation",
     "validate_flash_rwkv_installation",
 ]

@@ -16,8 +16,11 @@ from .backends.flash_rwkv import (
 )
 from .backends.provider import get_last_rwkv7_kernel, get_last_rwkv7_provider
 from .chunk import chunk_rwkv7
-from .fused_recurrent import fused_mul_recurrent_rwkv7, fused_recurrent_rwkv7
-from .recurrent import recurrent_rwkv7
+from .fused_recurrent import (
+    fused_mul_recurrent_rwkv7,
+    fused_recurrent_rwkv7,
+)
+from .recurrent import prepare_rwkv7_recurrent_metadata, recurrent_rwkv7
 
 __all__ = [
     'FLASH_RWKV_PUBLIC_OPERATORS',
@@ -31,6 +34,7 @@ __all__ = [
     'get_last_rwkv7_kernel',
     'get_last_rwkv7_provider',
     'preflight_flash_rwkv_installation',
+    'prepare_rwkv7_recurrent_metadata',
     'recurrent_rwkv7',
     'validate_flash_rwkv_installation',
 ]

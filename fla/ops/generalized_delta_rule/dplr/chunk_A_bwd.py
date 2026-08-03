@@ -409,6 +409,7 @@ def chunk_dplr_bwd_kernel_intra_tensorcore(
         for BK in [32, 64]
     ],
     key=['BK', 'BT', 'K'],
+    reset_to_zero=['d_decay_bias'],
     **autotune_cache_kwargs,
 )
 @triton.jit(do_not_specialize=['T'])
@@ -417,6 +418,9 @@ def chunk_dplr_bwd_dgk_kernel(
     dgk_offset,
     dgk_last,
     dgk_output,
+    gk_input,
+    decay_bias,
+    d_decay_bias,
     cu_seqlens,
     chunk_indices,
     T,
@@ -425,6 +429,9 @@ def chunk_dplr_bwd_dgk_kernel(
     BT: tl.constexpr,
     BK: tl.constexpr,
     IS_VARLEN: tl.constexpr,
+    HAS_DECAY_BIAS: tl.constexpr,
+    WRITE_DECAY_BIAS_GRAD: tl.constexpr,
+    RWKV7_DECAY_LOGITS: tl.constexpr,
 ):
     i_t, i_k, i_bh = tl.program_id(0).to(tl.int64), tl.program_id(1), tl.program_id(2).to(tl.int64)
     i_b, i_h = i_bh // H, i_bh % H
@@ -444,6 +451,7 @@ def chunk_dplr_bwd_dgk_kernel(
     dgk_offset += (bos * H + i_h) * K
     dgk_last += (i_tg * H + i_h) * K
     dgk_output += (bos * H + i_h) * K
+    gk_input += (bos * H + i_h) * K
     p_dgk_last = dgk_last + tl.arange(0, BK) + i_k * BK
     m_k = tl.arange(0, BK) + i_k * BK < K
     b_dgk_last = tl.load(p_dgk_last, mask=m_k, other=0)
@@ -459,6 +467,17 @@ def chunk_dplr_bwd_dgk_kernel(
     b_dgk_cumsum = tl.cumsum(b_dgk, 0, reverse=True)
     b_dgk_cumsum += b_dgk_last[None, :]
     b_dgk_cumsum -= b_dgk_offset
+    if RWKV7_DECAY_LOGITS:
+        p_gk_input = gk_input + o_t[:, None] * stride_qk + o_k[None, :]
+        b_decay_logits = tl.load(p_gk_input, mask=m_kk, other=0.0).to(tl.float32)
+        if HAS_DECAY_BIAS:
+            p_decay_bias = decay_bias + i_h * K + o_k
+            b_decay_logits += tl.load(p_decay_bias, mask=m_k, other=0.0)[None, :]
+        b_sigmoid = tl.sigmoid(b_decay_logits)
+        b_dgk_cumsum *= -0.6065306597126334 * b_sigmoid * (1.0 - b_sigmoid)
+        if WRITE_DECAY_BIAS_GRAD:
+            p_d_decay_bias = d_decay_bias + i_h * K + o_k
+            tl.atomic_add(p_d_decay_bias, tl.sum(b_dgk_cumsum, axis=0), mask=m_k)
     p_dgk_output = dgk_output + o_t[:, None] * stride_qk + o_k[None, :]
     tl.store(p_dgk_output, b_dgk_cumsum.to(p_dgk_output.dtype.element_ty), mask=m_kk)
 
@@ -484,6 +503,10 @@ def chunk_dplr_bwd_dqk_intra(
     chunk_size: int = 64,
     safe_gate: bool = False,
     chunk_indices: torch.LongTensor | None = None,
+    gk: torch.Tensor | None = None,
+    decay_bias: torch.Tensor | None = None,
+    output_decay_bias_grad: bool = False,
+    rwkv7_decay_logits: bool = False,
 ):
     B, T, H, K = q.shape
     BT = chunk_size
@@ -540,6 +563,14 @@ def chunk_dplr_bwd_dqk_intra(
     )
 
     dgk_output = torch.empty_like(dgk)
+    d_decay_bias = (
+        torch.zeros_like(decay_bias, dtype=torch.float)
+        if decay_bias is not None and output_decay_bias_grad
+        else None
+    )
+    d_decay_bias_buffer = d_decay_bias
+    if d_decay_bias_buffer is None:
+        d_decay_bias_buffer = torch.empty(1, dtype=torch.float, device=q.device)
 
     def grid(meta): return (NT, triton.cdiv(K, meta['BK']), B * H)
     chunk_dplr_bwd_dgk_kernel[grid](
@@ -547,11 +578,17 @@ def chunk_dplr_bwd_dqk_intra(
         dgk_offset=dgk_offset,
         dgk_last=dgk_last,
         dgk_output=dgk_output,
+        gk_input=gk if gk is not None else gi,
+        decay_bias=decay_bias,
+        d_decay_bias=d_decay_bias_buffer,
         cu_seqlens=cu_seqlens,
         chunk_indices=chunk_indices,
         T=T,
         H=H,
         K=K,
         BT=BT,
+        HAS_DECAY_BIAS=decay_bias is not None,
+        WRITE_DECAY_BIAS_GRAD=d_decay_bias is not None,
+        RWKV7_DECAY_LOGITS=rwkv7_decay_logits,
     )
-    return dq, dk, da, db, dgk_output
+    return dq, dk, da, db, dgk_output, d_decay_bias

@@ -23,6 +23,7 @@ import torch
 
 from fla.ops.rwkv7.backends.flash_rwkv import (
     FLASH_RWKV_PUBLIC_OPERATORS,
+    FLASH_RWKV_REQUIRED_OPERATORS,
     preflight_flash_rwkv_installation,
 )
 from fla.ops.rwkv7.backends.provider import (
@@ -35,7 +36,7 @@ if TYPE_CHECKING:
 
 
 def _invoke(operator: str, *args, **kwargs) -> Any:
-    if operator not in FLASH_RWKV_PUBLIC_OPERATORS:
+    if operator not in FLASH_RWKV_REQUIRED_OPERATORS:
         raise RuntimeError(f"unregistered FlashRWKV operator: {operator}")
     set_last_rwkv7_provider(None)
     set_last_rwkv7_kernel(None)
@@ -47,13 +48,9 @@ def _invoke(operator: str, *args, **kwargs) -> Any:
     return result
 
 
-def decay_logits_to_log_decay(decay_logits: torch.Tensor):
-    return _invoke("decay_logits_to_log_decay", decay_logits)
-
-
-def pretrain_recurrent_fp32io16_forward(
+def pretrain_recurrent_fp32io16_from_decay_logits(
     r: torch.Tensor,
-    log_decay: torch.Tensor,
+    decay_logits: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
     a: torch.Tensor,
@@ -62,11 +59,13 @@ def pretrain_recurrent_fp32io16_forward(
     scale: float = 1.0,
     initial_state: torch.Tensor | None = None,
     output_final_state: bool = False,
+    decay_bias: torch.Tensor | None = None,
+    elapsed_t: torch.Tensor | None = None,
 ):
     return _invoke(
         "pretrain_recurrent_fp32io16_forward",
         r,
-        log_decay,
+        decay_logits,
         k,
         v,
         a,
@@ -74,64 +73,14 @@ def pretrain_recurrent_fp32io16_forward(
         scale=scale,
         initial_state=initial_state,
         output_final_state=output_final_state,
+        decay_bias=decay_bias,
+        elapsed_t=elapsed_t,
     )
 
 
-def pretrain_recurrent_fp32io16(
+def rwkv7_recurrent_from_decay_logits(
     r: torch.Tensor,
-    log_decay: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    a: torch.Tensor,
-    b: torch.Tensor,
-    *,
-    scale: float = 1.0,
-    initial_state: torch.Tensor | None = None,
-    output_final_state: bool = False,
-):
-    return _invoke(
-        "pretrain_recurrent_fp32io16",
-        r,
-        log_decay,
-        k,
-        v,
-        a,
-        b,
-        scale=scale,
-        initial_state=initial_state,
-        output_final_state=output_final_state,
-    )
-
-
-def statetune_recurrent_fp32io16_forward(
-    r: torch.Tensor,
-    log_decay: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    a: torch.Tensor,
-    b: torch.Tensor,
-    *,
-    scale: float = 1.0,
-    initial_state: torch.Tensor,
-    output_final_state: bool = False,
-):
-    return _invoke(
-        "statetune_recurrent_fp32io16_forward",
-        r,
-        log_decay,
-        k,
-        v,
-        a,
-        b,
-        scale=scale,
-        initial_state=initial_state,
-        output_final_state=output_final_state,
-    )
-
-
-def rwkv7(
-    r: torch.Tensor,
-    log_decay: torch.Tensor,
+    decay_logits: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
     a: torch.Tensor,
@@ -143,14 +92,14 @@ def rwkv7(
     cu_seqlens: torch.Tensor | None = None,
     state_indices: torch.Tensor | None = None,
     mode: str = "fp32io16",
-    algorithm: str = "reference",
-    chunk_size: int | None = None,
-    chunk_config: ChunkConfig | None = None,
+    decay_bias: torch.Tensor | None = None,
+    elapsed_t: torch.Tensor | None = None,
+    validated_metadata: object | None = None,
 ):
     return _invoke(
-        "rwkv7",
+        "rwkv7_recurrent",
         r,
-        log_decay,
+        decay_logits,
         k,
         v,
         a,
@@ -161,15 +110,15 @@ def rwkv7(
         cu_seqlens=cu_seqlens,
         state_indices=state_indices,
         mode=mode,
-        algorithm=algorithm,
-        chunk_size=chunk_size,
-        chunk_config=chunk_config,
+        decay_bias=decay_bias,
+        elapsed_t=elapsed_t,
+        validated_metadata=validated_metadata,
     )
 
 
-def rwkv7_recurrent_stateful(
+def rwkv7_recurrent_stateful_from_decay_logits(
     r: torch.Tensor,
-    log_decay: torch.Tensor,
+    decay_logits: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
     a: torch.Tensor,
@@ -180,11 +129,14 @@ def rwkv7_recurrent_stateful(
     state_indices: torch.Tensor,
     scale: float = 1.0,
     mode: str = "fp32io16",
+    decay_bias: torch.Tensor | None = None,
+    elapsed_t: torch.Tensor | None = None,
+    validated_metadata: object | None = None,
 ):
     return _invoke(
         "rwkv7_recurrent_stateful",
         r,
-        log_decay,
+        decay_logits,
         k,
         v,
         a,
@@ -194,120 +146,25 @@ def rwkv7_recurrent_stateful(
         state_indices=state_indices,
         scale=scale,
         mode=mode,
+        decay_bias=decay_bias,
+        elapsed_t=elapsed_t,
+        validated_metadata=validated_metadata,
     )
 
 
-def infer_recurrent_fp32io16_forward_varlen(
-    r: torch.Tensor,
-    log_decay: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    a: torch.Tensor,
-    b: torch.Tensor,
-    *,
-    initial_state: torch.Tensor | None,
+def prepare_recurrent_metadata(
     cu_seqlens: torch.Tensor,
-    state_indices: torch.Tensor | None = None,
-    scale: float = 1.0,
-    output_final_state: bool = True,
-):
-    return _invoke(
-        "infer_recurrent_fp32io16_forward_varlen",
-        r,
-        log_decay,
-        k,
-        v,
-        a,
-        b,
-        initial_state=initial_state,
-        cu_seqlens=cu_seqlens,
-        state_indices=state_indices,
-        scale=scale,
-        output_final_state=output_final_state,
-    )
-
-
-def infer_recurrent_fp16_forward_varlen(
-    r: torch.Tensor,
-    log_decay: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    a: torch.Tensor,
-    b: torch.Tensor,
+    state_indices: torch.Tensor,
     *,
-    initial_state: torch.Tensor | None,
-    cu_seqlens: torch.Tensor,
-    state_indices: torch.Tensor | None = None,
-    scale: float = 1.0,
-    output_final_state: bool = True,
+    total_tokens: int,
+    state_pool_size: int,
 ):
     return _invoke(
-        "infer_recurrent_fp16_forward_varlen",
-        r,
-        log_decay,
-        k,
-        v,
-        a,
-        b,
-        initial_state=initial_state,
-        cu_seqlens=cu_seqlens,
-        state_indices=state_indices,
-        scale=scale,
-        output_final_state=output_final_state,
-    )
-
-
-def infer_chunk_bf16_forward(
-    r: torch.Tensor,
-    log_decay: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    a: torch.Tensor,
-    b: torch.Tensor,
-    *,
-    initial_state: torch.Tensor | None = None,
-    scale: float = 1.0,
-    output_final_state: bool = True,
-):
-    return _invoke(
-        "infer_chunk_bf16_forward",
-        r,
-        log_decay,
-        k,
-        v,
-        a,
-        b,
-        initial_state=initial_state,
-        scale=scale,
-        output_final_state=output_final_state,
-    )
-
-
-def infer_chunk_bf16_forward_varlen(
-    r: torch.Tensor,
-    log_decay: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    a: torch.Tensor,
-    b: torch.Tensor,
-    *,
-    initial_state: torch.Tensor | None,
-    cu_seqlens: torch.Tensor,
-    scale: float = 1.0,
-    output_final_state: bool = True,
-):
-    return _invoke(
-        "infer_chunk_bf16_forward_varlen",
-        r,
-        log_decay,
-        k,
-        v,
-        a,
-        b,
-        initial_state=initial_state,
-        cu_seqlens=cu_seqlens,
-        scale=scale,
-        output_final_state=output_final_state,
+        "prepare_recurrent_metadata",
+        cu_seqlens,
+        state_indices,
+        total_tokens=total_tokens,
+        state_pool_size=state_pool_size,
     )
 
 
@@ -328,9 +185,12 @@ def rwkv7_from_decay_logits(
     algorithm: str = "reference",
     chunk_size: int | None = None,
     chunk_config: ChunkConfig | None = None,
+    decay_bias: torch.Tensor | None = None,
+    elapsed_t: torch.Tensor | None = None,
+    validated_metadata: object | None = None,
 ):
     return _invoke(
-        "rwkv7_from_decay_logits",
+        "rwkv7",
         r,
         decay_logits,
         k,
@@ -346,36 +206,9 @@ def rwkv7_from_decay_logits(
         algorithm=algorithm,
         chunk_size=chunk_size,
         chunk_config=chunk_config,
-    )
-
-
-def rwkv7_reference(
-    r: torch.Tensor,
-    log_decay: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    a: torch.Tensor,
-    b: torch.Tensor,
-    *,
-    scale: float = 1.0,
-    initial_state: torch.Tensor | None = None,
-    output_final_state: bool = False,
-    cu_seqlens: torch.Tensor | None = None,
-    state_indices: torch.Tensor | None = None,
-):
-    return _invoke(
-        "rwkv7_reference",
-        r,
-        log_decay,
-        k,
-        v,
-        a,
-        b,
-        scale=scale,
-        initial_state=initial_state,
-        output_final_state=output_final_state,
-        cu_seqlens=cu_seqlens,
-        state_indices=state_indices,
+        decay_bias=decay_bias,
+        elapsed_t=elapsed_t,
+        validated_metadata=validated_metadata,
     )
 
 
@@ -495,38 +328,6 @@ def pretrain_head_l2wrap_ce_bf16(
         weight,
         targets,
         chunk_rows=chunk_rows,
-    )
-
-
-def rl_infctx_chunk_fp32io16_factor_recompute(
-    r: torch.Tensor,
-    log_decay: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    a: torch.Tensor,
-    b: torch.Tensor,
-    *,
-    scale: float = 1.0,
-    initial_state: torch.Tensor | None = None,
-    output_final_state: bool = True,
-    cu_seqlens: torch.Tensor | None = None,
-    state_indices: torch.Tensor | None = None,
-    chunk_size: int = 16,
-):
-    return _invoke(
-        "rl_infctx_chunk_fp32io16_factor_recompute",
-        r,
-        log_decay,
-        k,
-        v,
-        a,
-        b,
-        scale=scale,
-        initial_state=initial_state,
-        output_final_state=output_final_state,
-        cu_seqlens=cu_seqlens,
-        state_indices=state_indices,
-        chunk_size=chunk_size,
     )
 
 
