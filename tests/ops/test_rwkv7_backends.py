@@ -311,6 +311,105 @@ def test_rwkv7_layer_rejects_unknown_explicit_mode():
         RWKV7Attention(mode="unknown")
 
 
+def _isolate_rwkv7_layer_decay_path(monkeypatch, layer_module):
+    monkeypatch.setattr(layer_module, "can_use_flash_rwkv_inference", lambda *args, **kwargs: False)
+    monkeypatch.setattr(
+        layer_module,
+        "token_shift",
+        lambda hidden, *args, **kwargs: (torch.zeros_like(hidden), hidden[:, -1]),
+    )
+    monkeypatch.setattr(
+        layer_module,
+        "fused_addcmul_rwkv7",
+        lambda hidden, delta, *mixes: tuple(hidden + delta * mix for mix in mixes),
+    )
+    monkeypatch.setattr(layer_module, "fused_k_rwkv7", lambda key, *args: key)
+    monkeypatch.setattr(layer_module, "gate_output_correction", lambda output, *args: output)
+
+
+def test_rwkv7_layer_eval_with_grad_uses_combined_decay_logits_and_backpropagates(monkeypatch):
+    import fla.layers.rwkv7 as layer_module
+
+    _isolate_rwkv7_layer_decay_path(monkeypatch, layer_module)
+    captured = {}
+    original_split = layer_module._lora_delta_and_bias
+
+    def reject_decay_split(module, x):
+        if module is layer.w_lora:
+            pytest.fail("grad-enabled recurrent producer split its decay bias")
+        return original_split(module, x)
+
+    def recurrence(mode, **kwargs):
+        captured.update(mode=mode, **kwargs)
+        return kwargs["decay_logits"], None
+
+    layer = layer_module.RWKV7Attention(
+        mode="recurrent",
+        hidden_size=64,
+        head_dim=64,
+        layer_idx=0,
+        value_dim=64,
+        num_hidden_layers=2,
+    ).eval()
+    with torch.no_grad():
+        layer.o_proj.weight.copy_(torch.eye(64))
+    monkeypatch.setattr(layer_module, "_lora_delta_and_bias", reject_decay_split)
+    monkeypatch.setattr(layer_module, "_run_rwkv7_operator", recurrence)
+    hidden = torch.randn(2, 3, 64, requires_grad=True)
+
+    output = layer(hidden)[0]
+    output.square().sum().backward()
+
+    assert captured["mode"] == "recurrent"
+    assert captured["decay_bias"] is None
+    assert captured["decay_logits"].grad_fn is not None
+    assert hidden.grad is not None
+    assert torch.isfinite(hidden.grad).all()
+    assert layer.w_lora.lora[2].bias.grad is not None
+
+
+def test_rwkv7_layer_train_under_no_grad_uses_split_decay_bias_hot_path(monkeypatch):
+    import fla.layers.rwkv7 as layer_module
+
+    _isolate_rwkv7_layer_decay_path(monkeypatch, layer_module)
+    captured = {}
+    split_modules = []
+    original_split = layer_module._lora_delta_and_bias
+
+    def observe_split(module, x):
+        result = original_split(module, x)
+        if module is layer.w_lora:
+            split_modules.append(module)
+        return result
+
+    def recurrence(mode, **kwargs):
+        captured.update(mode=mode, **kwargs)
+        return kwargs["v"], None
+
+    layer = layer_module.RWKV7Attention(
+        mode="recurrent",
+        hidden_size=64,
+        head_dim=64,
+        layer_idx=0,
+        value_dim=64,
+        num_hidden_layers=2,
+    ).train()
+    with torch.no_grad():
+        layer.o_proj.weight.copy_(torch.eye(64))
+    monkeypatch.setattr(layer_module, "_lora_delta_and_bias", observe_split)
+    monkeypatch.setattr(layer_module, "_run_rwkv7_operator", recurrence)
+
+    with torch.no_grad():
+        output = layer(torch.randn(2, 3, 64))[0]
+
+    assert split_modules == [layer.w_lora]
+    assert captured["mode"] == "recurrent"
+    assert captured["decay_bias"] is not None
+    assert captured["decay_bias"].data_ptr() == layer.w_lora.lora[2].bias.data_ptr()
+    assert captured["decay_logits"].grad_fn is None
+    assert torch.isfinite(output).all()
+
+
 @pytest.mark.parametrize(
     ("overrides", "kwargs", "reason"),
     [

@@ -386,7 +386,7 @@ class RWKV7Attention(nn.Module):
             )
 
         r = self.r_proj(xr)
-        if self.mode == 'recurrent' and self.training:
+        if self.mode == 'recurrent' and torch.is_grad_enabled():
             # FlashRWKV's native training autograd consumes combined raw z and
             # propagates dz through the fused retention transform.
             decay_logits = self.w_lora(xw)
