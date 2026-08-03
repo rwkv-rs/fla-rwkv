@@ -21,7 +21,7 @@ from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 PRO6000_RUNNER_LABEL = "rwkv-sha-pro6000x8"
-FLASH_RWKV_SOURCE_REVISION = "5410491f0d6cff6058e5bd21cbab900b5b54f220"
+FLASH_RWKV_SOURCE_REVISION = "8b3d08a9a9430df23fb9da9b35fb0aa625faa1fb"
 REVISION_PATTERN = re.compile(r"^[0-9a-f]{40}$")
 RESULT_FIELDS = ("label", "B", "T", "iters", "p10_ms", "p50_ms", "p90_ms", "tok_s_p50")
 
