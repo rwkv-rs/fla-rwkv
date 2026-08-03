@@ -59,8 +59,6 @@ def pretrain_recurrent_fp32io16_forward(
     scale: float = 1.0,
     initial_state: torch.Tensor | None = None,
     output_final_state: bool = False,
-    decay_bias: torch.Tensor | None = None,
-    elapsed_t: torch.Tensor | None = None,
 ):
     return _invoke(
         "pretrain_recurrent_fp32io16_forward",
@@ -73,8 +71,6 @@ def pretrain_recurrent_fp32io16_forward(
         scale=scale,
         initial_state=initial_state,
         output_final_state=output_final_state,
-        decay_bias=decay_bias,
-        elapsed_t=elapsed_t,
     )
 
 

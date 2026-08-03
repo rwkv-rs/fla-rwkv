@@ -35,7 +35,6 @@ EXPECTED_PARAMETERS = {
     "pretrain_l2wrap_ce_bf16": ("logits", "targets"),
     "pretrain_recurrent_fp32io16_forward": (
         "r", "decay_logits", "k", "v", "a", "b", "scale", "initial_state", "output_final_state",
-        "decay_bias", "elapsed_t",
     ),
     "pretrain_tmix_a_gate_bf16": ("a0", "a12"),
     "pretrain_tmix_kk_pre_bf16": ("key", "key_scale", "learning_rate", "learning_rate_scale"),
