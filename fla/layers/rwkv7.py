@@ -115,7 +115,8 @@ def _lora_delta_and_bias(
     projection = module.lora[2]
     if projection.bias is None:
         raise RuntimeError("FlashRWKV fused gates require an explicit LoRA bias")
-    return F.linear(hidden, projection.weight), projection.bias
+    bias = projection.bias if torch.is_grad_enabled() else projection.bias.detach()
+    return F.linear(hidden, projection.weight), bias
 
 
 class RWKV7Attention(nn.Module):
