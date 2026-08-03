@@ -272,6 +272,16 @@ jobs:
             const marker = '<!-- fla-rwkv7-flash-adapter-report -->';
             const manifest = JSON.parse(
               fs.readFileSync('artifacts/rwkv7-flash-adapter/manifest.json', 'utf8'));
+            if (manifest.source_revision !== process.env.SOURCE_REVISION) {
+              throw new Error(
+                `FLA manifest revision mismatch: expected=${process.env.SOURCE_REVISION} ` +
+                `actual=${manifest.source_revision}`);
+            }
+            if (manifest.flash_rwkv_source_revision !== process.env.PROVIDER_REVISION) {
+              throw new Error(
+                `FlashRWKV manifest revision mismatch: expected=${process.env.PROVIDER_REVISION} ` +
+                `actual=${manifest.flash_rwkv_source_revision}`);
+            }
             const metric = value => String(Math.round(Number(value) * 1e6) / 1e6);
             const rows = [
               ...manifest.benchmarks,
@@ -289,9 +299,6 @@ jobs:
               '',
               `- FLA head: \`${process.env.SOURCE_REVISION}\``,
               `- FlashRWKV revision: \`${process.env.PROVIDER_REVISION}\``,
-              `- FlashRWKV clean evidence: \`${manifest.flash_rwkv_clean_evidence.evidence_revision}\`, ` +
-                `run \`${manifest.flash_rwkv_clean_evidence.workflow_run_id}\`, ` +
-                `artifact \`${manifest.flash_rwkv_clean_evidence.artifact_id}\``,
               `- GPU run: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
               `- Artifact SHA-256: \`${process.env.ARTIFACT_DIGEST}\``,
               '- Runner: `rwkv-sha-pro6000x8`, GPU 0',
