@@ -647,6 +647,10 @@ class FlashRWKVBackend(BaseBackend):
             tensor is not None and tensor.requires_grad
             for tensor in (r, decay_logits, k, v, a, b, initial_state)
         )
+        if requires_grad and (cu_seqlens is not None or state_indices is not None):
+            raise ValueError("FlashRWKV training supports fixed-length inputs only")
+        if requires_grad and mode != "fp32io16":
+            raise ValueError("FlashRWKV training requires mode='fp32io16'")
         if requires_grad and validated_metadata is not None:
             raise ValueError("validated_metadata is only supported for packed inference")
         if state_indices is not None:

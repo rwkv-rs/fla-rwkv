@@ -1150,6 +1150,42 @@ def test_recurrent_rwkv7_training_rejects_inference_only_decay_inputs(monkeypatc
     assert get_last_rwkv7_kernel() is None
 
 
+@pytest.mark.parametrize(
+    ("unsupported", "message"),
+    [
+        ({"cu_seqlens": object()}, "fixed-length inputs only"),
+        (
+            {"cu_seqlens": object(), "state_indices": object()},
+            "fixed-length inputs only",
+        ),
+        ({"mode": "fp16"}, "requires mode='fp32io16'"),
+    ],
+)
+def test_recurrent_rwkv7_training_rejects_unsupported_execution_before_provider(
+    monkeypatch,
+    unsupported,
+    message,
+):
+    fake_provider = SimpleNamespace(
+        pretrain_recurrent_fp32io16_forward=lambda *args, **kwargs: pytest.fail(
+            "unsupported training execution reached the provider"
+        ),
+        rwkv7_recurrent_stateful=lambda *args, **kwargs: pytest.fail(
+            "gradient execution reached the stateful inference provider"
+        ),
+    )
+    _admit_fake_provider(monkeypatch, fake_provider)
+
+    with pytest.raises(ValueError, match=message):
+        recurrent_rwkv7(
+            **_call_args(r=_tensor(requires_grad=True)),
+            **unsupported,
+        )
+
+    assert get_last_rwkv7_provider() is None
+    assert get_last_rwkv7_kernel() is None
+
+
 def test_public_recurrent_verifier_rejection_fails_closed(monkeypatch):
     monkeypatch.delenv("FLA_FLASH_RWKV", raising=False)
     monkeypatch.setattr(FlashRWKVBackend, "is_available", classmethod(lambda cls: True))
